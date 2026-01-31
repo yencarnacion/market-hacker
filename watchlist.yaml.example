@@ -1,0 +1,6 @@
+# watchlist.yaml
+watchlist:
+  - symbol: "AMD"
+  - symbol: "GOOG"
+  - symbol: "META"
+  - symbol: "PLTR"

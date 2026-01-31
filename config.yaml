@@ -1,0 +1,47 @@
+server:
+  host: "0.0.0.0"
+  port: 8097
+
+market:
+  timezone: "America/New_York"
+  open_time: "09:30:00"
+  selection_time: "09:35:00"
+  vwap_cross_cutoff_time: "09:43:00"
+  force_exit_time: "11:00:00"
+
+filters:
+  open_5m_range_pct_min: 0.07
+  open_5m_range_pct_max: 0.11
+  open_5m_vol_min: 100000
+  open_5m_vol_max: 500000
+
+  open_5m_today_pct_min: 500
+  open_5m_today_pct_max: 1500
+
+  entry_minutes_after_open_min: 5
+  entry_minutes_after_open_max: 12
+
+  entry_price_min: 10
+  entry_price_max: 80
+
+risk:
+  take_profit_pct: 0.05
+  stop_loss_pct: 0.02
+
+history:
+  open5m_lookback_sessions: 10
+  max_calendar_lookback_days: 35
+  max_workers: 6
+
+massive:
+  feed: "realtime"     # realtime | delayed
+  market: "stocks"     # stocks
+  ws_batch_size: 200   # batch subscribe calls (important for 8k tickers)
+
+openai:
+  tts_model: "tts-1"
+  voice: "alloy"
+  response_format: "mp3"
+
+ui:
+  max_events: 250

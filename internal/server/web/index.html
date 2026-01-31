@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Massive ORB Scanner</title>
+  <link rel="stylesheet" href="/styles.css"/>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">ORB</div>
+      <div>
+        <div class="title">Massive Open-5m ORB Scanner</div>
+        <div class="subtitle">09:35 filter → tick VWAP cross → TTS alerts</div>
+      </div>
+    </div>
+    <div class="controls">
+      <label class="toggle">
+        <input id="audioToggle" type="checkbox" checked/>
+        <span>Audio alerts</span>
+      </label>
+      <button id="testAudioBtn" class="btn">Test audio</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="card">
+      <h2>Status</h2>
+      <div id="status" class="status"></div>
+      <div class="kv">
+        <div><span>Now (NY)</span><strong id="now"></strong></div>
+        <div><span>Mode</span><strong id="mode"></strong></div>
+        <div><span>Phase</span><strong id="phase"></strong></div>
+        <div><span>Watchlist</span><strong id="watchCount"></strong></div>
+        <div><span>Tracked</span><strong id="trackedCount"></strong></div>
+        <div><span>Open</span><strong id="openTime"></strong></div>
+        <div><span>09:35</span><strong id="selTime"></strong></div>
+        <div><span>VWAP cutoff</span><strong id="cutoffTime"></strong></div>
+        <div><span>11:00</span><strong id="exitTime"></strong></div>
+      </div>
+    </section>
+
+    <section id="historicCard" class="card wide" style="display:none">
+      <h2>Historic performance (today)</h2>
+      <div class="hint">
+        Assumes <strong>1000 shares</strong> per BUY. Realized P/L uses the engine’s actual exit trigger price.
+        MFE/MAE are computed from entry → cutoff (config 11:00).
+      </div>
+
+      <div id="histSummary" class="summary-grid"></div>
+
+      <h2 style="margin-top:14px">Trades</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Ticker</th>
+              <th>Entry</th>
+              <th>Entry px</th>
+              <th>TP</th>
+              <th>SL</th>
+              <th>Exit</th>
+              <th>Exit px</th>
+              <th>Reason</th>
+              <th>Realized %</th>
+              <th>Realized $</th>
+              <th>MFE %</th>
+              <th>MFE $</th>
+              <th>MAE %</th>
+              <th>MAE $</th>
+              <th>Hold→Cutoff %</th>
+              <th>Hold→Cutoff $</th>
+            </tr>
+          </thead>
+          <tbody id="tradesBody"></tbody>
+        </table>
+      </div>
+
+      <h2 style="margin-top:14px">Selected but no entry</h2>
+      <div class="hint">Useful for diagnosing false positives (no VWAP cross in the entry window, Today% filter failures, etc.).</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Ticker</th>
+              <th>Open5m Vol</th>
+              <th>Open5m Range%</th>
+              <th>Open5m Today%</th>
+              <th>Saw Cross?</th>
+              <th>First Cross</th>
+              <th>Cross px</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="noEntryBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>Tracked tickers</h2>
+      <div class="hint">After 09:35 this list should be short (&lt; 20). Before 09:35 you’ll mostly see “collecting”.</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Ticker</th>
+              <th>Status</th>
+              <th>Last</th>
+              <th>VWAP</th>
+              <th>Min After Open</th>
+              <th>Open 09:30</th>
+              <th>Open5m Vol</th>
+              <th>Open5m Range%</th>
+              <th>Open5m Today%</th>
+              <th>Entry</th>
+              <th>TP</th>
+              <th>SL</th>
+            </tr>
+          </thead>
+          <tbody id="tickersBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>Event log</h2>
+      <div id="events" class="events"></div>
+    </section>
+  </main>
+
+  <audio id="player"></audio>
+  <script src="/app.js"></script>
+</body>
+</html>
