@@ -3,7 +3,20 @@ const $ = (id) => document.getElementById(id);
 const player = $("player");
 const audioToggle = $("audioToggle");
 
+// Historic controls (exist in DOM even if the card is hidden)
+const historicDateInput = $("historicDate");
+const histPrevBtn = $("histPrevBtn");
+const histNextBtn = $("histNextBtn");
+const histTodayBtn = $("histTodayBtn");
+const histLoadBtn = $("histLoadBtn");
+const historicSubtitle = $("historicSubtitle");
+const historicNote = $("historicNote");
+
 const seenEventIDs = new Set();
+let currentSessionID = null;
+let pendingHistoricRequest = false;
+let histMinISO = "";
+let histMaxISO = "";
 
 function fmt(n, digits=2) {
   if (n === null || n === undefined) return "—";
@@ -29,6 +42,77 @@ function badge(status) {
   else if (s === "TIME_EXIT") cls = "neutral";
   else if (s === "SELECTED" || s === "TRACKING") cls = "warn";
   return `<span class="badge ${cls}">${status || "—"}</span>`;
+}
+
+function setHistoricNote(text) {
+  if (!historicNote) return;
+  if (!text) {
+    historicNote.style.display = "none";
+    historicNote.textContent = "";
+    return;
+  }
+  historicNote.style.display = "";
+  historicNote.textContent = text;
+}
+
+function setHistoricControlsDisabled(disabled) {
+  for (const el of [historicDateInput, histPrevBtn, histNextBtn, histTodayBtn, histLoadBtn]) {
+    if (el) el.disabled = !!disabled;
+  }
+}
+
+function clampISO(iso) {
+  if (!iso) return iso;
+  if (histMinISO && iso < histMinISO) return histMinISO;
+  if (histMaxISO && iso > histMaxISO) return histMaxISO;
+  return iso;
+}
+
+function addDaysISO(iso, delta) {
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + delta);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
+
+function stepWeekdayISO(iso, delta) {
+  let cur = iso;
+  for (let i = 0; i < 10; i++) {
+    cur = addDaysISO(cur, delta);
+    const dow = new Date(cur + "T00:00:00Z").getUTCDay(); // 0=Sun,6=Sat
+    if (dow !== 0 && dow !== 6) return cur;
+  }
+  return cur;
+}
+
+async function requestHistoricRun(dateISO) {
+  if (!dateISO) return;
+  if (pendingHistoricRequest) return;
+
+  pendingHistoricRequest = true;
+  setHistoricControlsDisabled(true);
+  if (histLoadBtn) histLoadBtn.textContent = "Loading…";
+  setHistoricNote("Starting historic replay…");
+
+  try {
+    const res = await fetch(`/api/historic/run?date=${encodeURIComponent(dateISO)}`, {
+      method: "POST",
+      cache: "no-store",
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setHistoricNote(body?.error || `Failed to start historic replay (${res.status})`);
+    }
+  } catch (_) {
+    setHistoricNote("Failed to start historic replay (network error).");
+  } finally {
+    pendingHistoricRequest = false;
+    if (histLoadBtn) histLoadBtn.textContent = "Load";
+    // re-enable is controlled by renderState() based on phase
+  }
 }
 
 async function fetchState() {
@@ -98,13 +182,44 @@ function connectEvents() {
   });
 }
 
-function renderHistoric(report, mode) {
+function renderHistoric(report, mode, st) {
   const card = $("historicCard");
-  if (mode !== "historic" || !report || !report.summary) {
+  if (mode !== "historic") {
     card.style.display = "none";
     return;
   }
   card.style.display = "";
+
+  // date picker bounds & value
+  histMinISO = st.historic_min_date_ny || "";
+  histMaxISO = st.historic_max_date_ny || "";
+  if (historicDateInput) {
+    if (histMinISO) historicDateInput.min = histMinISO;
+    if (histMaxISO) historicDateInput.max = histMaxISO;
+  }
+
+  const resolvedISO = st.historic_resolved_date_ny || report?.summary?.date_ny || "";
+  const targetISO = st.historic_target_date_ny || "";
+  const displayISO = clampISO(resolvedISO || targetISO || (st.now_ny || "").slice(0, 10));
+  if (historicDateInput && document.activeElement !== historicDateInput) {
+    if (historicDateInput.value !== displayISO) historicDateInput.value = displayISO;
+  }
+
+  const busy = pendingHistoricRequest || (st.phase && st.phase !== "closed");
+  setHistoricControlsDisabled(busy);
+
+  if (historicSubtitle) {
+    const windowText = report?.summary ? `${report.summary.window_start_ny} → ${report.summary.window_end_ny}` : "";
+    historicSubtitle.textContent = displayISO ? `Session: ${displayISO}${windowText ? " · " + windowText : ""}` : "Pick a date to replay the session.";
+  }
+
+  const note = st.historic_note || "";
+  setHistoricNote(note);
+
+  if (!report || !report.summary) {
+    // still running / not ready yet
+    return;
+  }
 
   const s = report.summary;
   const metrics = [
@@ -197,6 +312,13 @@ function renderState(st) {
   const mode = st.mode || "realtime";
   $("mode").textContent = mode;
 
+  // New session boundary: clear UI caches so identical event IDs across replays don't get ignored
+  if (st.session_id && st.session_id !== currentSessionID) {
+    currentSessionID = st.session_id;
+    seenEventIDs.clear();
+    $("events").innerHTML = "";
+  }
+
   // Audio UX: disabled in historic mode
   if (mode === "historic") {
     audioToggle.checked = false;
@@ -218,7 +340,7 @@ function renderState(st) {
   syncEvents(st.events || []);
 
   // Historic report
-  renderHistoric(st.historic_report, mode);
+  renderHistoric(st.historic_report, mode, st);
 
   // Existing tickers table (still useful)
   const body = $("tickersBody");
@@ -262,6 +384,49 @@ async function loop() {
 $("testAudioBtn").addEventListener("click", () => {
   addEvent({ time_ny:"—", type:"TEST", message:"(Audio fires on BUY/PROFIT/STOP/11AM if OPENAI_API_KEY is set and mode is realtime.)" });
 });
+
+// Historic control wiring
+if (historicDateInput) {
+  historicDateInput.addEventListener("change", () => {
+    const iso = clampISO(historicDateInput.value);
+    if (iso) requestHistoricRun(iso);
+  });
+}
+if (histLoadBtn) {
+  histLoadBtn.addEventListener("click", () => {
+    const iso = clampISO(historicDateInput?.value);
+    if (iso) requestHistoricRun(iso);
+  });
+}
+if (histTodayBtn) {
+  histTodayBtn.addEventListener("click", () => {
+    const iso = clampISO(histMaxISO);
+    if (historicDateInput && iso) {
+      historicDateInput.value = iso;
+      requestHistoricRun(iso);
+    }
+  });
+}
+if (histPrevBtn) {
+  histPrevBtn.addEventListener("click", () => {
+    const base = clampISO(historicDateInput?.value || histMaxISO);
+    const iso = clampISO(stepWeekdayISO(base, -1));
+    if (historicDateInput && iso) {
+      historicDateInput.value = iso;
+      requestHistoricRun(iso);
+    }
+  });
+}
+if (histNextBtn) {
+  histNextBtn.addEventListener("click", () => {
+    const base = clampISO(historicDateInput?.value || histMaxISO);
+    const iso = clampISO(stepWeekdayISO(base, +1));
+    if (historicDateInput && iso) {
+      historicDateInput.value = iso;
+      requestHistoricRun(iso);
+    }
+  });
+}
 
 connectEvents();
 loop();

@@ -16,36 +16,59 @@ import (
 const historicShares = 1000
 
 func (e *Engine) RunHistoric(ctx context.Context) error {
+	// Preserve existing behavior: "today", but now with market-closed resolution.
 	nowNY := time.Now().In(e.loc)
+	return e.RunHistoricForDate(ctx, nowNY)
+}
 
-	openNY := atTime(nowNY, e.cfg.Market.OpenTime, e.loc)
-	selNY := atTime(nowNY, e.cfg.Market.SelectionTime, e.loc)
-	cutoffNY := atTime(nowNY, e.cfg.Market.VWAPCrossCutoff, e.loc)
-	exitNY := atTime(nowNY, e.cfg.Market.ForceExitTime, e.loc)
+// RunHistoricForDate replays the ORB session for the requested date (NY).
+// If the market is closed / no data exists (weekends, holidays), it falls back to the most recent prior session.
+func (e *Engine) RunHistoricForDate(ctx context.Context, targetDateNY time.Time) error {
+	asOfNY := time.Now().In(e.loc)
+	targetDayNY := dateOnlyInLoc(targetDateNY, e.loc)
 
-	// IMPORTANT: avoid lookahead if someone runs historic before force-exit.
+	restClient := massive.NewREST(e.massiveKey)
+	rest := newRESTShim(restClient)
+
+	resolvedDayNY, note, err := e.resolveHistoricSessionDate(ctx, rest, targetDayNY, asOfNY)
+	if err != nil {
+		e.st.SetPhase(store.PhaseClosed)
+		e.emit(asOfNY, "SYSTEM", "", fmt.Sprintf("Historic date resolution failed for %s: %v", targetDayNY.Format("2006-01-02"), err), "", "warn")
+		return err
+	}
+
+	// Reset store for a clean replay + UI session boundary
+	e.st.ResetForHistoricRun(targetDayNY, resolvedDayNY, note)
+
+	openNY := atTime(resolvedDayNY, e.cfg.Market.OpenTime, e.loc)
+	selNY := atTime(resolvedDayNY, e.cfg.Market.SelectionTime, e.loc)
+	cutoffNY := atTime(resolvedDayNY, e.cfg.Market.VWAPCrossCutoff, e.loc)
+	exitNY := atTime(resolvedDayNY, e.cfg.Market.ForceExitTime, e.loc)
+
+	// IMPORTANT: avoid lookahead only when replaying "today".
 	endNY := exitNY
-	if nowNY.Before(exitNY) {
-		endNY = nowNY
+	if sameDayInLoc(resolvedDayNY, asOfNY, e.loc) && asOfNY.Before(exitNY) {
+		endNY = asOfNY
 	}
 
 	e.st.SetTimes(openNY, selNY, cutoffNY, exitNY)
 	e.st.SetPhase(store.PhaseCollecting5m)
 
-	e.emit(nowNY, "SYSTEM", "", fmt.Sprintf("HISTORIC mode: replaying %s from %s → %s (force exit %s).",
-		nowNY.Format("2006-01-02"),
+	e.emit(asOfNY, "SYSTEM", "", fmt.Sprintf("HISTORIC mode: replaying %s from %s → %s (force exit %s).",
+		resolvedDayNY.Format("2006-01-02"),
 		openNY.Format("15:04:05"),
 		endNY.Format("15:04:05"),
 		exitNY.Format("15:04:05"),
 	), "", "info")
-	e.emit(nowNY, "SYSTEM", "", "Audio alerts disabled in historic mode.", "", "info")
-
-	restClient := massive.NewREST(e.massiveKey)
-	rest := newRESTShim(restClient)
+	if note != "" {
+		e.emit(asOfNY, "SYSTEM", "", note, "", "info")
+	}
+	e.emit(asOfNY, "SYSTEM", "", "Audio alerts disabled in historic mode.", "", "info")
 
 	// Phase 1: build open-5m metrics via REST aggs
-	e.emit(nowNY, "SYSTEM", "", "Fetching 09:30–09:34 minute bars via REST for open-5m metrics...", "", "info")
+	e.emit(asOfNY, "SYSTEM", "", "Fetching 09:30–09:34 minute bars via REST for open-5m metrics...", "", "info")
 	if err := e.collectOpen5mViaREST(ctx, rest, openNY, selNY); err != nil {
+		e.st.SetPhase(store.PhaseClosed)
 		return err
 	}
 
@@ -55,7 +78,7 @@ func (e *Engine) RunHistoric(ctx context.Context) error {
 		e.emit(time.Now().In(e.loc), "SYSTEM", "", "No tickers matched open_5m filters at 09:35.", "", "info")
 		e.st.SetPhase(store.PhaseClosed)
 
-		rep := e.buildHistoricReport(nowNY, openNY, selNY, cutoffNY, exitNY, endNY)
+		rep := e.buildHistoricReport(resolvedDayNY, openNY, selNY, cutoffNY, exitNY, endNY)
 		e.st.SetHistoricReport(&rep)
 		return nil
 	}
@@ -83,8 +106,18 @@ func (e *Engine) RunHistoric(ctx context.Context) error {
 	), "", "info")
 
 	for _, sym := range syms {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		it := rest.ListTrades(ctx, sym, selNY, endNY)
 		for it.Next() {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
 			tr := it.Item()
 			tsMillis := tradeTimeMillis(tr)
 			if tsMillis == 0 {
@@ -108,11 +141,114 @@ func (e *Engine) RunHistoric(ctx context.Context) error {
 
 	e.st.SetPhase(store.PhaseClosed)
 
-	rep := e.buildHistoricReport(nowNY, openNY, selNY, cutoffNY, exitNY, endNY)
+	rep := e.buildHistoricReport(resolvedDayNY, openNY, selNY, cutoffNY, exitNY, endNY)
 	e.st.SetHistoricReport(&rep)
 
 	e.emit(time.Now().In(e.loc), "SYSTEM", "", "Historic report ready (see the web UI).", "", "info")
 	return nil
+}
+
+func dateOnlyInLoc(t time.Time, loc *time.Location) time.Time {
+	tt := t.In(loc)
+	return time.Date(tt.Year(), tt.Month(), tt.Day(), 0, 0, 0, 0, loc)
+}
+
+func sameDayInLoc(a, b time.Time, loc *time.Location) bool {
+	aa := a.In(loc)
+	bb := b.In(loc)
+	return aa.Year() == bb.Year() && aa.Month() == bb.Month() && aa.Day() == bb.Day()
+}
+
+// resolveHistoricSessionDate returns a trading session date to use:
+// - clamps future dates
+// - skips weekends
+// - detects holidays/closed days by probing for open-5m data; falls back to prior session
+func (e *Engine) resolveHistoricSessionDate(ctx context.Context, rest *mrestClientShim, targetDayNY, asOfNY time.Time) (resolvedDayNY time.Time, note string, err error) {
+	targetDayNY = dateOnlyInLoc(targetDayNY, e.loc)
+	todayNY := dateOnlyInLoc(asOfNY, e.loc)
+	if targetDayNY.After(todayNY) {
+		return time.Time{}, "", fmt.Errorf("date is in the future (max %s)", todayNY.Format("2006-01-02"))
+	}
+
+	d := targetDayNY
+	// start by skipping weekends fast
+	if d.Weekday() == time.Saturday {
+		d = d.AddDate(0, 0, -1)
+	} else if d.Weekday() == time.Sunday {
+		d = d.AddDate(0, 0, -2)
+	}
+
+	maxAttempts := e.cfg.History.MaxCalendarLookback + 15
+	if maxAttempts < 10 {
+		maxAttempts = 10
+	}
+
+	for i := 0; i < maxAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return time.Time{}, "", ctx.Err()
+		default:
+		}
+
+		openNY := atTime(d, e.cfg.Market.OpenTime, e.loc)
+		selNY := atTime(d, e.cfg.Market.SelectionTime, e.loc)
+
+		ok, derr := e.hasOpen5mData(ctx, rest, openNY, selNY)
+		if derr != nil {
+			return time.Time{}, "", derr
+		}
+		if ok {
+			if !sameDayInLoc(d, targetDayNY, e.loc) {
+				return d, fmt.Sprintf("Requested %s; market closed / no data — showing %s.", targetDayNY.Format("2006-01-02"), d.Format("2006-01-02")), nil
+			}
+			return d, "", nil
+		}
+
+		// step back and skip weekends
+		d = d.AddDate(0, 0, -1)
+		for d.Weekday() == time.Saturday {
+			d = d.AddDate(0, 0, -1)
+		}
+		for d.Weekday() == time.Sunday {
+			d = d.AddDate(0, 0, -2)
+		}
+	}
+
+	return time.Time{}, "", fmt.Errorf("no market session data found within %d days of %s", maxAttempts, targetDayNY.Format("2006-01-02"))
+}
+
+func (e *Engine) hasOpen5mData(ctx context.Context, rest *mrestClientShim, openNY, selNY time.Time) (bool, error) {
+	wl := e.st.Watchlist()
+	if len(wl) == 0 {
+		return false, fmt.Errorf("watchlist is empty")
+	}
+	n := len(wl)
+	if n > 8 {
+		n = 8
+	}
+
+	var lastErr error
+	sawNonErr := false
+	for i := 0; i < n; i++ {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		default:
+		}
+		o, hi, lo, vol, ok, err := rest.Open5mMetrics(ctx, wl[i], openNY, selNY)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		sawNonErr = true
+		if ok && o > 0 && hi > 0 && lo > 0 && vol > 0 {
+			return true, nil
+		}
+	}
+	if !sawNonErr && lastErr != nil {
+		return false, lastErr
+	}
+	return false, nil
 }
 
 func (e *Engine) collectOpen5mViaREST(ctx context.Context, rest *mrestClientShim, openNY, selNY time.Time) error {
@@ -214,7 +350,7 @@ func tradeTimeMillis(tr models.Trade) int64 {
 	return 0
 }
 
-func (e *Engine) buildHistoricReport(nowNY, openNY, selNY, cutoffNY, exitNY, endNY time.Time) store.HistoricReport {
+func (e *Engine) buildHistoricReport(sessionDateNY, openNY, selNY, cutoffNY, exitNY, endNY time.Time) store.HistoricReport {
 	states := e.st.TickerStates()
 
 	trades := make([]store.HistoricTrade, 0, 32)
@@ -400,7 +536,7 @@ func (e *Engine) buildHistoricReport(nowNY, openNY, selNY, cutoffNY, exitNY, end
 	}
 
 	summary := store.HistoricSummary{
-		DateNY:        nowNY.Format("2006-01-02"),
+		DateNY:        sessionDateNY.Format("2006-01-02"),
 		WindowStartNY: openNY.Format("15:04:05"),
 		WindowEndNY:   endNY.Format("15:04:05"),
 		Shares:        historicShares,

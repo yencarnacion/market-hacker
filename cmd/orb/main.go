@@ -73,13 +73,11 @@ func main() {
 	}
 
 	eng := engine.New(cfg, st, massiveKey, tts)
-	srv := server.New(cfg, st)
+	srv := server.New(cfg, st, eng)
 
 	go func() {
 		var runErr error
-		if *historic {
-			runErr = eng.RunHistoric(ctx)
-		} else {
+		if !*historic {
 			runErr = eng.Run(ctx)
 		}
 		if runErr != nil {
@@ -96,6 +94,12 @@ func main() {
 			stop()
 		}
 	}()
+
+	// In historic mode, queue the initial run (today). The engine will resolve weekends/holidays automatically.
+	if *historic {
+		loc, _ := time.LoadLocation(cfg.Market.Timezone)
+		srv.QueueHistoricRun(time.Now().In(loc))
+	}
 
 	<-ctx.Done()
 	log.Printf("Shutting down...")

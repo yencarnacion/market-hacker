@@ -352,14 +352,17 @@ func (e *Engine) buildTrackedStates(
 	}
 
 	go func() {
+		defer close(jobs)
 		for _, sym := range candidates {
 			select {
 			case <-ctx.Done():
-				break
+				return
 			case jobs <- sym:
 			}
 		}
-		close(jobs)
+	}()
+
+	go func() {
 		wg.Wait()
 		close(results)
 	}()
@@ -417,6 +420,11 @@ func (e *Engine) buildTrackedStates(
 func (e *Engine) seedVWAPFromTrades(ctx context.Context, rest *mrestClientShim, sym string, startNY, endNY time.Time, ts *store.TickerState) error {
 	it := rest.ListTrades(ctx, sym, startNY, endNY)
 	for it.Next() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		tr := it.Item()
 		// models.Trade has Price/Size (float64) and Timestamp (nanos) in the REST models :contentReference[oaicite:8]{index=8}
 		if tr.Price <= 0 || tr.Size <= 0 {
@@ -447,6 +455,11 @@ func (e *Engine) avgPrevSessionsOpen5mVol(
 	day := openNY
 
 	for back := 1; back <= maxLookbackDays && len(vols) < sessionsNeeded; back++ {
+		select {
+		case <-ctx.Done():
+			return 0, 0, ctx.Err()
+		default:
+		}
 		d := day.AddDate(0, 0, -back)
 		start := time.Date(d.Year(), d.Month(), d.Day(), 9, 30, 0, 0, e.loc)
 		end := start.Add(5 * time.Minute)

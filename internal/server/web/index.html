@@ -42,7 +42,22 @@
     </section>
 
     <section id="historicCard" class="card wide" style="display:none">
-      <h2>Historic performance (today)</h2>
+      <div class="card-head">
+        <div>
+          <h2>Historic performance</h2>
+          <div id="historicSubtitle" class="hint">Pick a date to replay the session.</div>
+        </div>
+        <div class="hist-controls">
+          <button id="histPrevBtn" class="btn btn-icon" title="Previous day">◀</button>
+          <input id="historicDate" class="date-input" type="date"/>
+          <button id="histNextBtn" class="btn btn-icon" title="Next day">▶</button>
+          <button id="histTodayBtn" class="btn" title="Jump to today">Today</button>
+          <button id="histLoadBtn" class="btn" title="Replay selected date">Load</button>
+        </div>
+      </div>
+
+      <div id="historicNote" class="hint" style="display:none; margin-top:8px;"></div>
+
       <div class="hint">
         Assumes <strong>1000 shares</strong> per BUY. Realized P/L uses the engine’s actual exit trigger price.
         MFE/MAE are computed from entry → cutoff (config 11:00).

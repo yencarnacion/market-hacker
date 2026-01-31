@@ -17,6 +17,7 @@ body{
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
   background: radial-gradient(1200px 900px at 10% 0%, #16224a, var(--bg));
   color:var(--text);
+  color-scheme: dark;
 }
 
 .topbar{
@@ -72,6 +73,42 @@ body{
 
 h2{margin:0 0 10px 0; font-size:14px; color: #dfe6ff}
 .hint{color:var(--muted); font-size:12px; margin-bottom:10px}
+
+.card-head{
+  display:flex;
+  align-items:flex-end;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+}
+
+.hist-controls{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  flex-wrap:wrap;
+}
+
+.date-input{
+  background: rgba(0,0,0,0.18);
+  border:1px solid rgba(255,255,255,0.12);
+  color: var(--text);
+  padding:8px 10px;
+  border-radius:10px;
+  min-height: 36px;
+}
+.date-input:focus{
+  outline:none;
+  border-color: rgba(122,162,255,0.60);
+  box-shadow: 0 0 0 3px rgba(122,162,255,0.15);
+}
+
+.btn.btn-icon{
+  width:40px;
+  padding:8px 0;
+  text-align:center;
+}
+.btn:disabled, .date-input:disabled{opacity:0.55; cursor:not-allowed}
 
 .kv{
   display:grid;

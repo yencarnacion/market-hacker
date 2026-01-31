@@ -1,6 +1,7 @@
 package store
 
 import (
+	"strconv"
 	"sync"
 	"time"
 
@@ -189,6 +190,12 @@ type Store struct {
 	mode Mode
 	historicReport *HistoricReport
 
+	// increments/changes whenever we start a new historic replay so the UI can reset
+	sessionID string
+	historicTargetDateNY   time.Time
+	historicResolvedDateNY time.Time
+	historicNote           string
+
 	mu sync.RWMutex
 
 	phase Phase
@@ -220,6 +227,13 @@ type Snapshot struct {
 	Tickers         []PublicTicker `json:"tickers"`
 	Events          []Event       `json:"events"`
 	HistoricReport  *HistoricReport `json:"historic_report,omitempty"`
+
+	SessionID              string `json:"session_id"`
+	HistoricTargetDateNY   string `json:"historic_target_date_ny,omitempty"`
+	HistoricResolvedDateNY string `json:"historic_resolved_date_ny,omitempty"`
+	HistoricNote           string `json:"historic_note,omitempty"`
+	HistoricMinDateNY      string `json:"historic_min_date_ny,omitempty"`
+	HistoricMaxDateNY      string `json:"historic_max_date_ny,omitempty"`
 }
 
 func New(cfg config.Config, watchlist []string) *Store {
@@ -230,6 +244,7 @@ func New(cfg config.Config, watchlist []string) *Store {
 	return &Store{
 		cfg:       cfg,
 		mode:      ModeRealtime,
+		sessionID: strconv.FormatInt(time.Now().UnixNano(), 10),
 		phase:     PhaseWaitingOpen,
 		watchlist: watchlist,
 		watchset:  ws,
@@ -257,6 +272,26 @@ func (s *Store) SetHistoricReport(r *HistoricReport) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.historicReport = r
+}
+
+// ResetForHistoricRun clears volatile session state (tickers, events, report, audio)
+// and updates UI-facing historic metadata. Intended to be called at the start of each historic replay.
+func (s *Store) ResetForHistoricRun(targetDateNY, resolvedDateNY time.Time, note string) (sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.sessionID = strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	s.historicTargetDateNY = targetDateNY
+	s.historicResolvedDateNY = resolvedDateNY
+	s.historicNote = note
+
+	s.historicReport = nil
+	s.tickers = make(map[string]*TickerState, 64)
+	s.events = make([]Event, 0, s.cfg.UI.MaxEvents)
+	s.audio = make(map[string][]byte, 256)
+
+	return s.sessionID
 }
 
 func (s *Store) TickerStates() []TickerState {
@@ -399,6 +434,24 @@ func (s *Store) Snapshot(nowNY time.Time) Snapshot {
 		rep = &cp
 	}
 
+	// Historic date picker bounds (NY)
+	histMin := ""
+	histMax := ""
+	if s.mode == ModeHistoric {
+		day := time.Date(nowNY.Year(), nowNY.Month(), nowNY.Day(), 0, 0, 0, 0, nowNY.Location())
+		histMax = day.Format("2006-01-02")
+		histMin = day.AddDate(0, 0, -s.cfg.History.MaxCalendarLookback).Format("2006-01-02")
+	}
+
+	tgt := ""
+	res := ""
+	if !s.historicTargetDateNY.IsZero() {
+		tgt = s.historicTargetDateNY.Format("2006-01-02")
+	}
+	if !s.historicResolvedDateNY.IsZero() {
+		res = s.historicResolvedDateNY.Format("2006-01-02")
+	}
+
 	return Snapshot{
 		NowNY:           nowNY.Format("2006-01-02 15:04:05"),
 		Mode:            s.mode,
@@ -412,5 +465,12 @@ func (s *Store) Snapshot(nowNY time.Time) Snapshot {
 		Tickers:         tickers,
 		Events:          events,
 		HistoricReport:  rep,
+
+		SessionID:              s.sessionID,
+		HistoricTargetDateNY:   tgt,
+		HistoricResolvedDateNY: res,
+		HistoricNote:           s.historicNote,
+		HistoricMinDateNY:      histMin,
+		HistoricMaxDateNY:      histMax,
 	}
 }
