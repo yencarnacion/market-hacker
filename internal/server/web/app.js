@@ -86,7 +86,6 @@ let currentChartKey = ""; // `${chartsDateISO}:${symbol}`
 let currentChartPayload = null;
 let currentChartBars = null;     // raw bars from API (includes optional prev-close at 09:29)
 let currentChartOpenUnix = 0;    // 09:30 NY in unix seconds
-let currentChartInitN = 0;       // initial shown bar count
 let currentChartShownN = 0;      // current shown bar count (step mode)
 let currentChartFull = null;     // { candles, volumes, sma9, vwap, barsLen } for FULL bars
 let currentChartSep = null;      // { t0, t1 } times for boundary (set on "Show Rest")
@@ -384,7 +383,6 @@ function resetChartsState() {
   currentChartPayload = null;
   currentChartBars = null;
   currentChartOpenUnix = 0;
-  currentChartInitN = 0;
   currentChartShownN = 0;
   currentChartFull = null;
   currentChartSep = null;
@@ -822,7 +820,6 @@ async function showChartAt(idx) {
       // fallback (shouldn't happen): show a small prefix
       initN = Math.min(bars.length, 1 + INITIAL_MINUTES_AFTER_OPEN);
     }
-    currentChartInitN = initN;
     currentChartShownN = initN;
 
     // Paint initial (guess) view

@@ -14,11 +14,11 @@ type Config struct {
 	} `yaml:"server"`
 
 	Market struct {
-		Timezone          string `yaml:"timezone"`
-		OpenTime          string `yaml:"open_time"`
-		SelectionTime     string `yaml:"selection_time"`
-		VWAPCrossCutoff   string `yaml:"vwap_cross_cutoff_time"`
-		ForceExitTime     string `yaml:"force_exit_time"`
+		Timezone        string `yaml:"timezone"`
+		OpenTime        string `yaml:"open_time"`
+		SelectionTime   string `yaml:"selection_time"`
+		VWAPCrossCutoff string `yaml:"vwap_cross_cutoff_time"`
+		ForceExitTime   string `yaml:"force_exit_time"`
 	} `yaml:"market"`
 
 	Filters struct {
@@ -54,9 +54,9 @@ type Config struct {
 	} `yaml:"massive"`
 
 	OpenAI struct {
-		TTSModel        string `yaml:"tts_model"`
-		Voice           string `yaml:"voice"`
-		ResponseFormat  string `yaml:"response_format"`
+		TTSModel       string `yaml:"tts_model"`
+		Voice          string `yaml:"voice"`
+		ResponseFormat string `yaml:"response_format"`
 	} `yaml:"openai"`
 
 	UI struct {

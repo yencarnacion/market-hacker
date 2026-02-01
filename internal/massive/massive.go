@@ -11,10 +11,6 @@ import (
 	wsmodels "github.com/massive-com/client-go/v2/websocket/models"
 )
 
-type Clients struct {
-	REST *mrest.Client
-}
-
 func NewREST(apiKey string) *mrest.Client {
 	return mrest.New(apiKey)
 }

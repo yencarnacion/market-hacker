@@ -18,10 +18,10 @@ import (
 )
 
 type Engine struct {
-	cfg       config.Config
-	st        *store.Store
+	cfg        config.Config
+	st         *store.Store
 	massiveKey string
-	tts       *openai.TTSClient
+	tts        *openai.TTSClient
 
 	loc *time.Location
 }
@@ -29,11 +29,11 @@ type Engine struct {
 func New(cfg config.Config, st *store.Store, massiveKey string, tts *openai.TTSClient) *Engine {
 	loc, _ := time.LoadLocation(cfg.Market.Timezone)
 	return &Engine{
-		cfg:       cfg,
-		st:        st,
+		cfg:        cfg,
+		st:         st,
 		massiveKey: massiveKey,
-		tts:       tts,
-		loc:       loc,
+		tts:        tts,
+		loc:        loc,
 	}
 }
 
@@ -314,10 +314,10 @@ func (e *Engine) buildTrackedStates(
 
 	// worker pool for historical open5m volumes
 	type result struct {
-		sym        string
-		avgPrev10  float64
-		todayPct   float64
-		err        error
+		sym       string
+		avgPrev10 float64
+		todayPct  float64
+		err       error
 	}
 
 	jobs := make(chan string)
@@ -339,7 +339,7 @@ func (e *Engine) buildTrackedStates(
 					results <- result{sym: sym, err: fmt.Errorf("missing ticker state")}
 					continue
 				}
-				avg, used, err := e.avgPrevSessionsOpen5mVol(ctx, rest, sym, openNY, cfg.History.Open5mLookbackSessions, cfg.History.MaxCalendarLookback)
+				avg, err := e.avgPrevSessionsOpen5mVol(ctx, rest, sym, openNY, cfg.History.Open5mLookbackSessions, cfg.History.MaxCalendarLookback)
 				if err != nil {
 					results <- result{sym: sym, err: err}
 					continue
@@ -348,7 +348,6 @@ func (e *Engine) buildTrackedStates(
 				if avg > 0 {
 					pct = (t.Open5mVol / avg) * 100.0
 				}
-				_ = used
 				results <- result{sym: sym, avgPrev10: avg, todayPct: pct, err: nil}
 			}
 		}()
@@ -483,14 +482,14 @@ func (e *Engine) avgPrevSessionsOpen5mVol(
 	openNY time.Time,
 	sessionsNeeded int,
 	maxLookbackDays int,
-) (avg float64, used int, err error) {
+) (avg float64, err error) {
 	var vols []float64
 	day := openNY
 
 	for back := 1; back <= maxLookbackDays && len(vols) < sessionsNeeded; back++ {
 		select {
 		case <-ctx.Done():
-			return 0, 0, ctx.Err()
+			return 0, ctx.Err()
 		default:
 		}
 		d := day.AddDate(0, 0, -back)
@@ -508,13 +507,13 @@ func (e *Engine) avgPrevSessionsOpen5mVol(
 	}
 
 	if len(vols) == 0 {
-		return 0, 0, fmt.Errorf("no prior sessions found in lookback=%d days", maxLookbackDays)
+		return 0, fmt.Errorf("no prior sessions found in lookback=%d days", maxLookbackDays)
 	}
 	sum := 0.0
 	for _, v := range vols {
 		sum += v
 	}
-	return sum / float64(len(vols)), len(vols), nil
+	return sum / float64(len(vols)), nil
 }
 
 // ---- Trades processing (tick data) ----
@@ -751,7 +750,7 @@ func (e *Engine) say(tsNY time.Time, typ, sym, text string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	audioID, audioBytes, _, err := e.tts.Synthesize(ctx, text)
+	audioID, audioBytes, err := e.tts.Synthesize(ctx, text)
 	if err != nil {
 		log.Printf("tts failed (%s %s): %v", typ, sym, err)
 		return ""

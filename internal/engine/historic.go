@@ -16,12 +16,6 @@ import (
 
 const historicShares = 1000
 
-func (e *Engine) RunHistoric(ctx context.Context) error {
-	// Preserve existing behavior: "today", but now with market-closed resolution.
-	nowNY := time.Now().In(e.loc)
-	return e.RunHistoricForDate(ctx, nowNY)
-}
-
 // correctCandidatesOpen5mViaREST re-fetches the official 09:30–09:35 bars for the selected tickers only,
 // then re-applies the current open5m filters. This is used in "start after 09:30" scenarios to avoid
 // REST-calling the full watchlist but still make final candidates accurate.
@@ -567,13 +561,13 @@ func (e *Engine) collectOpen5mViaREST(ctx context.Context, rest *mrestClientShim
 	wl := e.st.Watchlist()
 
 	type res struct {
-		sym   string
-		o930  float64
-		hi    float64
-		lo    float64
-		vol   float64
-		ok    bool
-		err   error
+		sym  string
+		o930 float64
+		hi   float64
+		lo   float64
+		vol  float64
+		ok   bool
+		err  error
 	}
 
 	jobs := make(chan string)
@@ -799,14 +793,19 @@ func (e *Engine) buildHistoricReport(sessionDateNY, openNY, selNY, cutoffNY, exi
 			}
 
 			noEntries = append(noEntries, store.HistoricNoEntry{
-				Symbol:            t.Symbol,
-				Open5mVol:         t.Open5mVol,
-				Open5mRangePct:    t.Open5mRangePct,
-				Open5mTodayPct:    t.Open5mTodayPct,
-				SawCrossInWindow:  t.SawCrossInWindow,
-				FirstCrossTimeNY:  func() string { if t.FirstCrossTime.IsZero() { return "" }; return t.FirstCrossTime.In(e.loc).Format("15:04:05") }(),
-				FirstCrossPrice:   t.FirstCrossPrice,
-				Reason:            reason,
+				Symbol:           t.Symbol,
+				Open5mVol:        t.Open5mVol,
+				Open5mRangePct:   t.Open5mRangePct,
+				Open5mTodayPct:   t.Open5mTodayPct,
+				SawCrossInWindow: t.SawCrossInWindow,
+				FirstCrossTimeNY: func() string {
+					if t.FirstCrossTime.IsZero() {
+						return ""
+					}
+					return t.FirstCrossTime.In(e.loc).Format("15:04:05")
+				}(),
+				FirstCrossPrice: t.FirstCrossPrice,
+				Reason:          reason,
 			})
 		}
 	}

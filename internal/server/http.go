@@ -33,10 +33,10 @@ type Server struct {
 
 func New(cfg config.Config, st *store.Store, eng *engine.Engine) *Server {
 	return &Server{
-		cfg: cfg,
-		st:  st,
-		hub: NewSSEHub(),
-		eng: eng,
+		cfg:      cfg,
+		st:       st,
+		hub:      NewSSEHub(),
+		eng:      eng,
 		histReqC: make(chan time.Time, 1),
 	}
 }
@@ -67,7 +67,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	srv := &http.Server{
-		Addr:    s.cfg.Server.Host + ":" + itoa(s.cfg.Server.Port),
+		Addr:    fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port),
 		Handler: mux,
 	}
 
@@ -82,7 +82,7 @@ func (s *Server) Run(ctx context.Context) error {
 // ---- NEW: chart bars endpoint ----
 
 type chartBar struct {
-	Time   int64   `json:"time"`   // unix seconds
+	Time   int64   `json:"time"` // unix seconds
 	Open   float64 `json:"open"`
 	High   float64 `json:"high"`
 	Low    float64 `json:"low"`
@@ -130,7 +130,7 @@ func (s *Server) handleChartBars(w http.ResponseWriter, r *http.Request) {
 	}
 	dayNY = time.Date(dayNY.Year(), dayNY.Month(), dayNY.Day(), 0, 0, 0, 0, loc)
 
-	openNY := atTimeInLoc(dayNY, s.cfg.Market.OpenTime, loc) // usually 09:30:00
+	openNY := atTimeInLoc(dayNY, s.cfg.Market.OpenTime, loc)      // usually 09:30:00
 	exitNY := atTimeInLoc(dayNY, s.cfg.Market.ForceExitTime, loc) // usually 11:00:00
 
 	// Request 09:30 → 11:00 (range is [from,to))

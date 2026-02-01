@@ -131,23 +131,23 @@ type Event struct {
 }
 
 type PublicTicker struct {
-	Symbol            string  `json:"symbol"`
-	Open0930          float64 `json:"open_0930"`
-	Open5mVol         float64 `json:"open_5m_vol"`
-	Open5mRangePct    float64 `json:"open_5m_range_pct"`
-	Prev10AvgOpen5m   float64 `json:"prev10_avg_open5m_vol"`
-	Open5mTodayPct    float64 `json:"open_5m_today_pct"`
+	Symbol          string  `json:"symbol"`
+	Open0930        float64 `json:"open_0930"`
+	Open5mVol       float64 `json:"open_5m_vol"`
+	Open5mRangePct  float64 `json:"open_5m_range_pct"`
+	Prev10AvgOpen5m float64 `json:"prev10_avg_open5m_vol"`
+	Open5mTodayPct  float64 `json:"open_5m_today_pct"`
 
-	SawCrossInWindow  bool    `json:"saw_cross_in_window"`
-	FirstCrossTimeNY  string  `json:"first_cross_time_ny,omitempty"`
-	FirstCrossPrice   float64 `json:"first_cross_price"`
-	VWAP              float64 `json:"vwap"`
-	LastPrice         float64 `json:"last_price"`
-	MinutesAfterOpen  float64 `json:"minutes_after_open"`
-	Status            string  `json:"status"`
-	EntryPrice        float64 `json:"entry_price"`
-	TakeProfitPrice   float64 `json:"take_profit_price"`
-	StopPrice         float64 `json:"stop_price"`
+	SawCrossInWindow bool    `json:"saw_cross_in_window"`
+	FirstCrossTimeNY string  `json:"first_cross_time_ny,omitempty"`
+	FirstCrossPrice  float64 `json:"first_cross_price"`
+	VWAP             float64 `json:"vwap"`
+	LastPrice        float64 `json:"last_price"`
+	MinutesAfterOpen float64 `json:"minutes_after_open"`
+	Status           string  `json:"status"`
+	EntryPrice       float64 `json:"entry_price"`
+	TakeProfitPrice  float64 `json:"take_profit_price"`
+	StopPrice        float64 `json:"stop_price"`
 }
 
 type TickerState struct {
@@ -157,10 +157,10 @@ type TickerState struct {
 	Open0930 float64
 	// true if Open0930 was estimated from the first minute bar we saw (when starting after 09:30)
 	Open0930Estimated bool
-	ORHigh   float64
-	ORLow    float64
-	Open5mVol float64
-	Open5mRangePct float64
+	ORHigh            float64
+	ORLow             float64
+	Open5mVol         float64
+	Open5mRangePct    float64
 
 	// history metric at/after 09:35
 	Prev10AvgOpen5mVol float64
@@ -180,13 +180,13 @@ type TickerState struct {
 	MinutesAfterOpen float64
 
 	// trade lifecycle
-	HasPosition      bool
-	EntryPrice       float64
-	EntryTime        time.Time
-	TakeProfitPrice  float64
-	StopPrice        float64
-	Exited           bool
-	ExitReason       string
+	HasPosition     bool
+	EntryPrice      float64
+	EntryTime       time.Time
+	TakeProfitPrice float64
+	StopPrice       float64
+	Exited          bool
+	ExitReason      string
 
 	// entry/exit details for reporting
 	EntryMinutesAfterOpen float64
@@ -211,13 +211,13 @@ type TickerState struct {
 type Store struct {
 	cfg config.Config
 
-	mode Mode
+	mode           Mode
 	historicReport *HistoricReport
 
 	filters RuntimeFilters
 
 	// increments/changes whenever we start a new historic replay so the UI can reset
-	sessionID string
+	sessionID              string
 	historicTargetDateNY   time.Time
 	historicResolvedDateNY time.Time
 	historicNote           string
@@ -241,18 +241,18 @@ type Store struct {
 }
 
 type Snapshot struct {
-	NowNY           string        `json:"now_ny"`
-	Mode            Mode          `json:"mode"`
-	Phase           Phase         `json:"phase"`
-	WatchlistCount  int           `json:"watchlist_count"`
-	OpenTimeNY      string        `json:"open_time_ny"`
-	SelectionTimeNY string        `json:"selection_time_ny"`
-	VwapCutoffNY    string        `json:"vwap_cutoff_ny"`
-	ForceExitNY     string        `json:"force_exit_ny"`
-	TrackedCount    int           `json:"tracked_count"`
-	Tickers         []PublicTicker `json:"tickers"`
-	Filters         RuntimeFilters `json:"filters"`
-	Events          []Event       `json:"events"`
+	NowNY           string          `json:"now_ny"`
+	Mode            Mode            `json:"mode"`
+	Phase           Phase           `json:"phase"`
+	WatchlistCount  int             `json:"watchlist_count"`
+	OpenTimeNY      string          `json:"open_time_ny"`
+	SelectionTimeNY string          `json:"selection_time_ny"`
+	VwapCutoffNY    string          `json:"vwap_cutoff_ny"`
+	ForceExitNY     string          `json:"force_exit_ny"`
+	TrackedCount    int             `json:"tracked_count"`
+	Tickers         []PublicTicker  `json:"tickers"`
+	Filters         RuntimeFilters  `json:"filters"`
+	Events          []Event         `json:"events"`
 	HistoricReport  *HistoricReport `json:"historic_report,omitempty"`
 
 	SessionID              string `json:"session_id"`
@@ -315,8 +315,6 @@ func New(cfg config.Config, watchlist []string) *Store {
 		audio:     make(map[string][]byte, 256),
 	}
 }
-
-func (s *Store) Config() config.Config { return s.cfg }
 
 func (s *Store) SetMode(m Mode) {
 	s.mu.Lock()
@@ -425,12 +423,6 @@ func (s *Store) SetPhase(p Phase) {
 	s.phase = p
 }
 
-func (s *Store) Phase() Phase {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.phase
-}
-
 func (s *Store) UpsertTicker(sym string, fn func(t *TickerState)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -503,7 +495,9 @@ func (s *Store) Snapshot(nowNY time.Time) Snapshot {
 			Open5mTodayPct:   t.Open5mTodayPct,
 			SawCrossInWindow: t.SawCrossInWindow,
 			FirstCrossTimeNY: func() string {
-				if t.FirstCrossTime.IsZero() { return "" }
+				if t.FirstCrossTime.IsZero() {
+					return ""
+				}
 				return t.FirstCrossTime.In(nowNY.Location()).Format("15:04:05")
 			}(),
 			FirstCrossPrice:  t.FirstCrossPrice,

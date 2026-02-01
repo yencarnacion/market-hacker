@@ -94,9 +94,9 @@ type TradeIter struct {
 	it *iter.Iter[models.Trade]
 }
 
-func (t TradeIter) Next() bool           { return t.it.Next() }
-func (t TradeIter) Item() models.Trade   { return t.it.Item() }
-func (t TradeIter) Err() error           { return t.it.Err() }
+func (t TradeIter) Next() bool         { return t.it.Next() }
+func (t TradeIter) Item() models.Trade { return t.it.Item() }
+func (t TradeIter) Err() error         { return t.it.Err() }
 
 func (r *mrestClientShim) ListTrades(ctx context.Context, ticker string, startNY, endNY time.Time) TradeIter {
 	params := models.ListTradesParams{Ticker: ticker}.
