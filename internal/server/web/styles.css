@@ -257,3 +257,51 @@ tbody td{
 tr.pos td { color: var(--good); }
 tr.neg td { color: var(--bad); }
 tr.flat td { color: var(--muted); }
+
+/* --- Charts slideshow (Of interest) --- */
+.charts-toolbar{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  flex-wrap:wrap;
+  margin:10px 0;
+}
+
+.chart-panel{
+  margin:12px 0 14px;
+  padding:10px;
+  background: rgba(0,0,0,0.18);
+  border:1px solid rgba(255,255,255,0.06);
+  border-radius:14px;
+}
+
+.chart-head{
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-start;
+  gap:12px;
+  flex-wrap:wrap;
+  margin-bottom:10px;
+}
+
+.chart-actions{
+  display:flex;
+  gap:10px;
+  align-items:center;
+}
+
+.chart-sym{
+  font-weight:800;
+  letter-spacing:0.2px;
+}
+
+.chart-container{
+  width:100%;
+  height:520px; /* adjust if you want taller/shorter */
+  position: relative; /* needed for the separator overlay canvas */
+}
+
+/* optional: make chart a bit shorter on small screens */
+@media (max-width: 900px){
+  .chart-container{ height:420px; }
+}

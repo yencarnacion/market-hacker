@@ -160,6 +160,30 @@
 
       <h2 id="noEntryTitle" style="margin-top:14px">Selected but no entry</h2>
       <div id="noEntryHint" class="hint">Useful for diagnosing false positives (no VWAP cross in the entry window, Today% filter failures, etc.).</div>
+
+      <!-- NEW: chart slideshow controls (shown only in “Of interest” mode via JS) -->
+      <div id="chartsToolbar" class="charts-toolbar" style="display:none">
+        <button id="showChartsBtn" class="btn">Show Charts</button>
+        <button id="chartPrevBtn" class="btn btn-icon" title="Previous chart">◀</button>
+        <button id="chartNextBtn" class="btn btn-icon" title="Next chart">▶</button>
+        <select id="chartTickerSelect" class="date-input" style="min-width:120px"></select>
+        <div id="chartCounter" class="hint" style="margin:0"></div>
+      </div>
+
+      <div id="chartPanel" class="chart-panel" style="display:none">
+        <div class="chart-head">
+          <div>
+            <div id="chartSym" class="chart-sym">—</div>
+            <div id="chartMeta" class="hint" style="margin:0"></div>
+          </div>
+          <div class="chart-actions">
+            <button id="chartNextBarBtn" class="btn">Show next</button>
+            <button id="chartRevealBtn" class="btn">Show Rest</button>
+            <button id="hideChartsBtn" class="btn">Hide</button>
+          </div>
+        </div>
+        <div id="chartContainer" class="chart-container"></div>
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
@@ -212,6 +236,9 @@
   </main>
 
   <audio id="player"></audio>
+  <!-- Load TradingView Lightweight Charts BEFORE app.js -->
+  <!-- Pin v4 so addCandlestickSeries/addLineSeries/addHistogramSeries exist -->
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

@@ -7,6 +7,21 @@ const histPerformanceWrap = $("histPerformanceWrap");
 const noEntryTitle = $("noEntryTitle");
 const noEntryHint = $("noEntryHint");
 
+// Charts (Of interest slideshow)
+const chartsToolbar = $("chartsToolbar");
+const showChartsBtn = $("showChartsBtn");
+const hideChartsBtn = $("hideChartsBtn");
+const chartPrevBtn = $("chartPrevBtn");
+const chartNextBtn = $("chartNextBtn");
+const chartTickerSelect = $("chartTickerSelect");
+const chartCounter = $("chartCounter");
+const chartPanel = $("chartPanel");
+const chartContainer = $("chartContainer");
+const chartSym = $("chartSym");
+const chartMeta = $("chartMeta");
+const chartRevealBtn = $("chartRevealBtn");
+const chartNextBarBtn = $("chartNextBarBtn");
+
 const nfInt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 
 // Filters UI
@@ -38,6 +53,49 @@ let pendingHistoricRequest = false;
 let histMinISO = "";
 let histMaxISO = "";
 let lastState = null;
+
+// -----------------------------
+// Charts state (Of interest slideshow)
+// -----------------------------
+let chartsDateISO = "";
+let chartsOpen = false;
+let chartIndex = 0;
+let interestTickers = [];
+const chartDataCache = new Map(); // sym -> payload from /api/chart/bars
+
+// lightweight-charts instances
+let lwChart = null;
+let lwCandle = null;
+let lwSMA = null;
+let lwVWAP = null;
+let lwVolume = null;
+let lwOnResize = null;
+let chartsTimeZone = "America/New_York";
+
+// -----------------------------
+// "Guess then reveal" state
+// -----------------------------
+// Initial window:
+// - optional 09:29 prev-close (if present)
+// - 09:30–09:35 inclusive (6 bars)
+const INITIAL_MINUTES_AFTER_OPEN = 6; // 09:30..09:35 inclusive
+
+// Key of the currently loaded chart. Used to prevent the 1s poll render loop
+// from re-calling showChartAt() and resetting the "Show next" progress.
+let currentChartKey = ""; // `${chartsDateISO}:${symbol}`
+let currentChartPayload = null;
+let currentChartBars = null;     // raw bars from API (includes optional prev-close at 09:29)
+let currentChartOpenUnix = 0;    // 09:30 NY in unix seconds
+let currentChartInitN = 0;       // initial shown bar count
+let currentChartShownN = 0;      // current shown bar count (step mode)
+let currentChartFull = null;     // { candles, volumes, sma9, vwap, barsLen } for FULL bars
+let currentChartSep = null;      // { t0, t1 } times for boundary (set on "Show Rest")
+
+// Separator overlay (vertical line)
+let boundaryCanvas = null;
+let boundaryT0 = null; // unix sec time of last shown bar
+let boundaryT1 = null; // unix sec time of first newly revealed bar
+let boundaryHandler = null;
 
 // -----------------------------
 // Filters: allow staged edits
@@ -316,13 +374,481 @@ function connectEvents() {
   });
 }
 
+function resetChartsState() {
+  chartsDateISO = "";
+  chartsOpen = false;
+  chartIndex = 0;
+  interestTickers = [];
+  chartDataCache.clear();
+  currentChartKey = "";
+  currentChartPayload = null;
+  currentChartBars = null;
+  currentChartOpenUnix = 0;
+  currentChartInitN = 0;
+  currentChartShownN = 0;
+  currentChartFull = null;
+  currentChartSep = null;
+  boundaryT0 = null;
+  boundaryT1 = null;
+  hideChartsUI(true);
+  setChartsToolbarVisible(false);
+}
+
+function setChartsToolbarVisible(visible) {
+  if (!chartsToolbar) return;
+  chartsToolbar.style.display = visible ? "" : "none";
+}
+
+function hideChartsUI(destroy = false) {
+  if (chartPanel) chartPanel.style.display = "none";
+  if (chartMeta) chartMeta.textContent = "";
+  if (chartSym) chartSym.textContent = "—";
+  if (destroy) destroyLWChart();
+}
+
+function destroyLWChart() {
+  if (lwOnResize) {
+    window.removeEventListener("resize", lwOnResize);
+    lwOnResize = null;
+  }
+  // unsubscribe separator redraw
+  if (lwChart && boundaryHandler) {
+    try {
+      const ts = lwChart.timeScale && lwChart.timeScale();
+      if (ts && ts.unsubscribeVisibleLogicalRangeChange) {
+        ts.unsubscribeVisibleLogicalRangeChange(boundaryHandler);
+      }
+    } catch (_) {}
+  }
+  boundaryHandler = null;
+  boundaryT0 = null;
+  boundaryT1 = null;
+  boundaryCanvas = null;
+
+  if (lwChart) {
+    lwChart.remove();
+    lwChart = null;
+  }
+  lwCandle = lwSMA = lwVWAP = lwVolume = null;
+  if (chartContainer) chartContainer.innerHTML = "";
+}
+
+function ensureBoundaryCanvas() {
+  if (!chartContainer) return null;
+  if (boundaryCanvas && boundaryCanvas.isConnected) return boundaryCanvas;
+
+  // chartContainer is position:relative in CSS; create an absolute overlay.
+  boundaryCanvas = document.createElement("canvas");
+  boundaryCanvas.style.position = "absolute";
+  boundaryCanvas.style.inset = "0";
+  boundaryCanvas.style.pointerEvents = "none";
+  // Make sure it sits above lightweight-charts canvases
+  boundaryCanvas.style.zIndex = "999";
+  chartContainer.appendChild(boundaryCanvas);
+  return boundaryCanvas;
+}
+
+function clearBoundaryLine() {
+  boundaryT0 = null;
+  boundaryT1 = null;
+  if (!boundaryCanvas) return;
+  const c = boundaryCanvas.getContext("2d");
+  if (!c) return;
+  c.clearRect(0, 0, boundaryCanvas.width, boundaryCanvas.height);
+}
+
+function redrawBoundaryLine() {
+  if (!lwChart || !chartContainer) return;
+  if (!boundaryT0 || !boundaryT1) return;
+
+  const canvas = ensureBoundaryCanvas();
+  if (!canvas) return;
+
+  const rect = chartContainer.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(rect.width));
+  const h = Math.max(1, Math.floor(rect.height));
+
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+  canvas.width = Math.floor(w * dpr);
+  canvas.height = Math.floor(h * dpr);
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  let x0 = null;
+  let x1 = null;
+  try {
+    // IMPORTANT: timeToCoordinate works reliably only for times that exist on the scale.
+    // We store the two real bar times and draw halfway between their coordinates.
+    x0 = lwChart.timeScale().timeToCoordinate(boundaryT0);
+    x1 = lwChart.timeScale().timeToCoordinate(boundaryT1);
+  } catch (_) {}
+  if (x0 === null || x0 === undefined) return;
+  if (x1 === null || x1 === undefined) return;
+
+  const x = (x0 + x1) / 2;
+
+  ctx.save();
+  // Magenta dotted line
+  ctx.strokeStyle = "rgba(255, 0, 255, 0.95)";
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";      // makes short dashes look like dots
+  ctx.setLineDash([1, 7]);    // dotted pattern (tweak if desired)
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, h);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function setBoundaryLineBetween(t0, t1) {
+  boundaryT0 = t0 || null;
+  boundaryT1 = t1 || null;
+  if (!boundaryT0 || !boundaryT1) {
+    clearBoundaryLine();
+    return;
+  }
+  redrawBoundaryLine();
+}
+
+function ensureLWChart() {
+  if (!chartContainer) return false;
+  if (!window.LightweightCharts) {
+    if (chartMeta) chartMeta.textContent = "Lightweight Charts failed to load (CDN blocked?).";
+    return false;
+  }
+  if (lwChart) return true;
+
+  chartContainer.innerHTML = "";
+  boundaryCanvas = null;
+  boundaryT0 = null;
+  boundaryT1 = null;
+
+  const width = chartContainer.clientWidth || 900;
+  const height = chartContainer.clientHeight || 520;
+
+  // --- TWEAK THESE TWO NUMBERS TO TASTE ---
+  const VOLUME_HEIGHT = 0.25;     // 25% of chart height for volume (like your screenshot)
+  const BAR_SPACING_PX = 10;      // narrower bars (try 8..14)
+
+  const timeFormatter = (unixSec) => {
+    try {
+      const dt = new Date(unixSec * 1000);
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: chartsTimeZone || "America/New_York",
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+      }).format(dt);
+    } catch (_) {
+      return "";
+    }
+  };
+
+  lwChart = LightweightCharts.createChart(chartContainer, {
+    width,
+    height,
+    layout: {
+      background: { type: "solid", color: "#0b1020" },
+      textColor: "#e2e2e2",
+    },
+    grid: {
+      vertLines: { color: "rgba(255,255,255,0.06)" },
+      horzLines: { color: "rgba(255,255,255,0.06)" },
+    },
+
+    // IMPORTANT: this reserves the bottom band so candles don't draw there
+    rightPriceScale: {
+      borderColor: "rgba(255,255,255,0.10)",
+      scaleMargins: { top: 0.06, bottom: VOLUME_HEIGHT },
+    },
+
+    timeScale: {
+      timeVisible: true,
+      secondsVisible: false,
+      borderColor: "rgba(255,255,255,0.10)",
+      barSpacing: BAR_SPACING_PX, // narrower candles/volume bars
+      rightOffset: 0,
+    },
+
+    localization: { timeFormatter },
+  });
+
+  // ✅ Volume FIRST so it's drawn behind candles/lines
+  lwVolume = lwChart.addHistogramSeries({
+    priceFormat: { type: "volume" },
+    priceScaleId: "",              // overlay scale (keeps volume axis hidden)
+    lastValueVisible: false,
+    priceLineVisible: false,
+    scaleMargins: { top: 1 - VOLUME_HEIGHT, bottom: 0 },
+  });
+
+  // Candles
+  lwCandle = lwChart.addCandlestickSeries({
+    upColor: "rgba(32,201,151,1)",
+    downColor: "rgba(255,77,109,1)",
+    borderUpColor: "rgba(32,201,151,1)",
+    borderDownColor: "rgba(255,77,109,1)",
+    wickUpColor: "rgba(32,201,151,1)",
+    wickDownColor: "rgba(255,77,109,1)",
+  });
+
+  // 9 SMA (red)
+  lwSMA = lwChart.addLineSeries({
+    color: "red",
+    lineWidth: 2,
+  });
+
+  // VWAP since 09:30 (yellow)
+  lwVWAP = lwChart.addLineSeries({
+    color: "yellow",
+    lineWidth: 2,
+  });
+
+  lwOnResize = () => {
+    if (!lwChart || !chartContainer) return;
+    lwChart.resize(chartContainer.clientWidth || width, chartContainer.clientHeight || height);
+    redrawBoundaryLine();
+  };
+  window.addEventListener("resize", lwOnResize);
+
+  // keep separator positioned correctly on scroll/zoom
+  boundaryHandler = () => redrawBoundaryLine();
+  try {
+    const ts = lwChart.timeScale && lwChart.timeScale();
+    if (ts && ts.subscribeVisibleLogicalRangeChange) ts.subscribeVisibleLogicalRangeChange(boundaryHandler);
+  } catch (_) {}
+
+  return true;
+}
+
+function computeSMA9(bars, openUnix) {
+  const period = 9;
+  const win = [];
+  const out = [];
+  for (const b of bars) {
+    if (b.time < openUnix) continue; // start SMA at 09:30
+    win.push(b.close);
+    if (win.length > period) win.shift();
+    if (win.length === period) {
+      const sum = win.reduce((a, x) => a + x, 0);
+      out.push({ time: b.time, value: sum / period });
+    }
+  }
+  return out;
+}
+
+function computeVWAP(bars, openUnix) {
+  let cumPV = 0;
+  let cumV = 0;
+  const out = [];
+  for (const b of bars) {
+    if (b.time < openUnix) continue; // anchor at 09:30
+    const v = b.volume;
+    if (!isFinite(v) || v <= 0) continue;
+    const typical = (b.high + b.low + b.close) / 3;
+    cumPV += typical * v;
+    cumV += v;
+    if (cumV > 0) out.push({ time: b.time, value: cumPV / cumV });
+  }
+  return out;
+}
+
+async function fetchChartBars(sym) {
+  if (!chartsDateISO) throw new Error("missing chart date");
+  const key = `${chartsDateISO}:${sym}`;
+  if (chartDataCache.has(key)) return chartDataCache.get(key);
+
+  const res = await fetch(
+    `/api/chart/bars?symbol=${encodeURIComponent(sym)}&date=${encodeURIComponent(chartsDateISO)}`,
+    { cache: "no-store" }
+  );
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body?.ok) {
+    throw new Error(body?.error || `HTTP ${res.status}`);
+  }
+
+  chartDataCache.set(key, body);
+  return body;
+}
+
+function buildSeries(bars, openUnix) {
+  const candles = bars.map(b => ({
+    time: b.time,
+    open: b.open,
+    high: b.high,
+    low: b.low,
+    close: b.close,
+  }));
+
+  const volumes = bars.map(b => ({
+    time: b.time,
+    value: b.volume,
+    color: (b.close >= b.open) ? "rgba(32,201,151,0.55)" : "rgba(255,77,109,0.55)",
+  }));
+
+  const sma9 = computeSMA9(bars, openUnix);
+  const vwap = computeVWAP(bars, openUnix);
+
+  return { candles, volumes, sma9, vwap, barsLen: bars.length };
+}
+
+function paintCurrentChart() {
+  if (!lwChart || !lwCandle || !lwVolume || !lwSMA || !lwVWAP) return;
+  if (!currentChartPayload || !currentChartBars || !currentChartFull) return;
+
+  const total = currentChartFull.candles.length;
+  const shownNRaw = Math.max(0, Math.min(currentChartShownN, total));
+  const isFull = shownNRaw >= total;
+  const shown = isFull
+    ? currentChartFull
+    : buildSeries(currentChartBars.slice(0, shownNRaw), currentChartOpenUnix);
+  const shownN = shown.candles.length;
+
+  lwCandle.setData(shown.candles);
+  lwVolume.setData(shown.volumes);
+  lwSMA.setData(shown.sma9);
+  lwVWAP.setData(shown.vwap);
+
+  // ✅ Left-align: no symmetric padding, no "centered" display.
+  // Give a little extra space to the right (more when hidden, minimal when revealed).
+  const rightPad = isFull ? 2 : 14;
+  try {
+    lwChart.timeScale().setVisibleLogicalRange({
+      from: 0,
+      to: Math.max(0, (shownN - 1) + rightPad),
+    });
+  } catch (_) {
+    // fallback
+    try { lwChart.timeScale().fitContent(); } catch (_) {}
+  }
+
+  // Separator line persists after "Show Rest" (permanent reveal)
+  if (currentChartSep && currentChartSep.t0 && currentChartSep.t1) {
+    setBoundaryLineBetween(currentChartSep.t0, currentChartSep.t1);
+  }
+  else clearBoundaryLine();
+
+  // Button state
+  if (chartNextBarBtn) {
+    const hasNext = currentChartBars && currentChartShownN < currentChartBars.length;
+    chartNextBarBtn.disabled = !hasNext;
+  }
+  if (chartRevealBtn) {
+    const hasRest = currentChartBars && currentChartShownN < currentChartBars.length;
+    chartRevealBtn.disabled = !hasRest;
+    chartRevealBtn.textContent = hasRest ? "Show Rest" : "Rest Shown";
+  }
+
+  // Meta
+  const prev = currentChartPayload.prev_close_date_ny ? `PrevClose: ${currentChartPayload.prev_close_date_ny}` : "PrevClose: —";
+  const exitUnix = currentChartPayload.exit_unix || 0;
+  const exitHM = exitUnix ? new Intl.DateTimeFormat("en-US", {
+    timeZone: chartsTimeZone || "America/New_York", hour12:false, hour:"2-digit", minute:"2-digit"
+  }).format(new Date(exitUnix * 1000)) : "—";
+  if (chartMeta) {
+    const hint = (currentChartBars && currentChartShownN < currentChartBars.length)
+      ? `Click “Show next” (1 bar) or “Show Rest” (to ${exitHM})`
+      : `All bars shown → ${exitHM}`;
+    chartMeta.textContent = `${currentChartPayload.date_ny} · ${prev} · Showing ${shownN}/${total} · ${hint}`;
+  }
+}
+
+async function showChartAt(idx) {
+  if (!interestTickers.length) return;
+  if (!chartsDateISO) return;
+
+  chartsOpen = true;
+
+  // clamp index
+  if (idx < 0) idx = 0;
+  if (idx >= interestTickers.length) idx = interestTickers.length - 1;
+  chartIndex = idx;
+
+  const sym = interestTickers[chartIndex];
+  currentChartKey = `${chartsDateISO}:${sym}`;
+
+  if (chartTickerSelect) chartTickerSelect.value = sym;
+  if (chartCounter) chartCounter.textContent = `${chartIndex + 1} / ${interestTickers.length}`;
+  if (chartPrevBtn) chartPrevBtn.disabled = (chartIndex <= 0);
+  if (chartNextBtn) chartNextBtn.disabled = (chartIndex >= interestTickers.length - 1);
+
+  if (chartPanel) chartPanel.style.display = "";
+  if (chartSym) chartSym.textContent = sym;
+  if (chartMeta) chartMeta.textContent = "Loading…";
+
+  currentChartSep = null;
+  clearBoundaryLine();
+
+  try {
+    const payload = await fetchChartBars(sym);
+
+    chartsTimeZone = payload.timezone || chartsTimeZone || "America/New_York";
+    const openUnix = payload.open_unix || 0;
+
+    const bars = Array.isArray(payload.bars) ? payload.bars : [];
+    if (!bars.length) {
+      if (chartMeta) chartMeta.textContent = "No bars returned for this symbol/time window.";
+      destroyLWChart();
+      return;
+    }
+
+    if (!ensureLWChart()) return;
+
+    // Store payload for paintCurrentChart()
+    currentChartPayload = payload;
+    currentChartBars = bars;
+    currentChartOpenUnix = openUnix;
+
+    // Full series (used when "Show Rest" is on)
+    currentChartFull = buildSeries(bars, openUnix);
+
+    // Initial window count:
+    // - include any prev-close bar(s) with time < openUnix
+    // - include 09:30..09:35 inclusive => openUnix + (6-1)*60
+    const lastInitialUnix = openUnix ? (openUnix + (INITIAL_MINUTES_AFTER_OPEN - 1) * 60) : 0;
+    let initN = 0;
+    if (openUnix) {
+      for (const b of bars) {
+        if (b.time < openUnix) { initN++; continue; }
+        if (b.time <= lastInitialUnix) { initN++; continue; }
+        break; // bars are chronological
+      }
+    } else {
+      // fallback (shouldn't happen): show a small prefix
+      initN = Math.min(bars.length, 1 + INITIAL_MINUTES_AFTER_OPEN);
+    }
+    currentChartInitN = initN;
+    currentChartShownN = initN;
+
+    // Paint initial (guess) view
+    paintCurrentChart();
+
+  } catch (err) {
+    if (chartMeta) chartMeta.textContent = `Chart load failed: ${err?.message || err}`;
+    destroyLWChart();
+  }
+}
+
 function renderHistoric(report, mode, st) {
   const card = $("historicCard");
   if (mode !== "historic") {
     card.style.display = "none";
+    // NEW
+    resetChartsState();
     return;
   }
   card.style.display = "";
+
+  // If performance tables are shown, we do NOT show the Of-interest chart UI.
+  if (showHistoricPerformance) {
+    setChartsToolbarVisible(false);
+    hideChartsUI(true);
+  }
 
   // Show/hide performance tables
   if (histPerformanceWrap) {
@@ -387,6 +913,56 @@ function renderHistoric(report, mode, st) {
 
     const tickers = Array.isArray(st.tickers) ? st.tickers.slice() : [];
     tickers.sort((a,b) => (a.symbol || "").localeCompare(b.symbol || ""));
+
+    // NEW: update slideshow list + date
+    const syms = tickers.map(t => t.symbol).filter(Boolean);
+    chartsDateISO =
+      (st.historic_resolved_date_ny || st.historic_target_date_ny || (st.now_ny || "").slice(0,10) || "");
+    interestTickers = syms;
+
+    if (interestTickers.length) {
+      setChartsToolbarVisible(true);
+      if (showChartsBtn) showChartsBtn.disabled = false;
+
+      // Keep chartIndex stable by symbol when possible (prevents jumping if list changes)
+      if (chartsOpen && currentChartPayload?.symbol) {
+        const idx = interestTickers.indexOf(currentChartPayload.symbol);
+        if (idx >= 0) chartIndex = idx;
+      }
+      if (chartIndex >= interestTickers.length) chartIndex = 0;
+
+      const selectedSym = interestTickers[chartIndex] || "";
+
+      // Rebuild dropdown, preserve selection
+      if (chartTickerSelect) {
+        const prevVal = chartTickerSelect.value;
+        chartTickerSelect.innerHTML = interestTickers.map(s => `<option value="${s}">${s}</option>`).join("");
+        const nextVal = chartsOpen ? selectedSym : (interestTickers.includes(prevVal) ? prevVal : selectedSym);
+        if (nextVal) chartTickerSelect.value = nextVal;
+      }
+
+      // Toolbar state: don't stomp it to "—" while chart is open
+      if (chartCounter) {
+        chartCounter.textContent = chartsOpen
+          ? `${Math.min(chartIndex + 1, interestTickers.length)} / ${interestTickers.length}`
+          : `— / ${interestTickers.length}`;
+      }
+      if (chartPrevBtn) chartPrevBtn.disabled = chartsOpen ? (chartIndex <= 0) : true;
+      if (chartNextBtn) chartNextBtn.disabled = chartsOpen ? (chartIndex >= interestTickers.length - 1) : (interestTickers.length <= 1);
+
+      // CRITICAL FIX:
+      // Do NOT call showChartAt() every 1s poll. That resets currentChartShownN and makes bars "disappear".
+      if (chartsOpen) {
+        const desiredKey = selectedSym ? `${chartsDateISO}:${selectedSym}` : "";
+        const needsLoad = !desiredKey || !lwChart || !currentChartBars || (currentChartKey !== desiredKey);
+        if (needsLoad) showChartAt(chartIndex).catch(() => {});
+      } else {
+        hideChartsUI(true);
+      }
+    } else {
+      setChartsToolbarVisible(false);
+      hideChartsUI(true);
+    }
 
     for (const t of tickers) {
       const sym = t.symbol || "";
@@ -538,6 +1114,9 @@ function renderState(st) {
     currentSessionID = st.session_id;
     seenEventIDs.clear();
     $("events").innerHTML = "";
+
+    // NEW
+    resetChartsState();
   }
 
   // Audio UX: disabled in historic mode
@@ -662,6 +1241,68 @@ if (histNextBtn) {
       historicDateInput.value = iso;
       requestHistoricRun(iso);
     }
+  });
+}
+
+// Charts UI wiring
+if (showChartsBtn) {
+  showChartsBtn.addEventListener("click", () => {
+    if (!interestTickers.length) return;
+    chartsOpen = true;
+    chartIndex = 0; // start with the first chart in the Of-interest list
+    showChartAt(chartIndex).catch(() => {});
+  });
+}
+if (hideChartsBtn) {
+  hideChartsBtn.addEventListener("click", () => {
+    chartsOpen = false;
+    hideChartsUI(true);
+  });
+}
+if (chartPrevBtn) {
+  chartPrevBtn.addEventListener("click", () => {
+    showChartAt(chartIndex - 1).catch(() => {});
+  });
+}
+if (chartNextBtn) {
+  chartNextBtn.addEventListener("click", () => {
+    showChartAt(chartIndex + 1).catch(() => {});
+  });
+}
+if (chartTickerSelect) {
+  chartTickerSelect.addEventListener("change", () => {
+    const sym = chartTickerSelect.value;
+    const idx = interestTickers.indexOf(sym);
+    if (idx >= 0) showChartAt(idx).catch(() => {});
+  });
+}
+
+if (chartNextBarBtn) {
+  chartNextBarBtn.addEventListener("click", () => {
+    if (!currentChartPayload || !currentChartBars || !currentChartFull) return;
+    if (currentChartShownN >= currentChartBars.length) return;
+    currentChartShownN++;
+    paintCurrentChart();
+  });
+}
+
+if (chartRevealBtn) {
+  chartRevealBtn.addEventListener("click", () => {
+    if (!currentChartPayload || !currentChartBars || !currentChartFull) return;
+    // One-way reveal: permanently add remaining bars
+    if (currentChartShownN >= currentChartBars.length) return;
+
+    // Separator EXACTLY between last shown and first newly revealed
+    currentChartSep = null;
+    const n = currentChartShownN;
+    if (n > 0 && currentChartBars.length > n) {
+      const t0 = currentChartBars[n - 1]?.time;
+      const t1 = currentChartBars[n]?.time;
+      if (t0 && t1 && t1 > t0) currentChartSep = { t0, t1 };
+    }
+
+    currentChartShownN = currentChartBars.length;
+    paintCurrentChart();
   });
 }
 

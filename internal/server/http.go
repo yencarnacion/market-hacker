@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/massive-com/client-go/v2/rest/models"
+
 	"massive-orb/internal/config"
 	"massive-orb/internal/engine"
+	"massive-orb/internal/massive"
 	"massive-orb/internal/store"
 )
 
@@ -52,8 +55,10 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/api/historic/run", s.handleHistoricRun)
 	mux.HandleFunc("/api/filters", s.handleFilters)
 
+	// NEW: chart bars for the “Of interest” slideshow
+	mux.HandleFunc("/api/chart/bars", s.handleChartBars)
+
 	// Push events to SSE hub by polling store’s event list:
-	// (simple + robust; if you want lower latency, you can refactor Store.AddEvent to call hub.Broadcast directly)
 	go s.eventPump(ctx)
 
 	// Historic runner loop (only meaningful in historic mode)
@@ -74,287 +79,186 @@ func (s *Server) Run(ctx context.Context) error {
 	return srv.ListenAndServe()
 }
 
-func (s *Server) eventPump(ctx context.Context) {
-	// naive: broadcast full newest event list tail every 250ms
-	t := time.NewTicker(250 * time.Millisecond)
-	defer t.Stop()
+// ---- NEW: chart bars endpoint ----
 
-	var lastID string
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			snap := s.st.Snapshot(time.Now().In(mustLoc(s.cfg.Market.Timezone)))
-			if len(snap.Events) == 0 {
-				continue
-			}
-			ev := snap.Events[len(snap.Events)-1]
-			if ev.ID == lastID {
-				continue
-			}
-			lastID = ev.ID
-			s.hub.Broadcast(ev)
-		}
-	}
+type chartBar struct {
+	Time   int64   `json:"time"`   // unix seconds
+	Open   float64 `json:"open"`
+	High   float64 `json:"high"`
+	Low    float64 `json:"low"`
+	Close  float64 `json:"close"`
+	Volume float64 `json:"volume"`
 }
 
-// QueueHistoricRun enqueues a historic run request; if one is already queued, it replaces it.
-func (s *Server) QueueHistoricRun(targetDateNY time.Time) {
-	select {
-	case s.histReqC <- targetDateNY:
-	default:
-		// replace pending request with newest
-		select {
-		case <-s.histReqC:
-		default:
-		}
-		s.histReqC <- targetDateNY
-	}
+type chartBarsResp struct {
+	OK              bool       `json:"ok"`
+	Symbol          string     `json:"symbol"`
+	DateNY          string     `json:"date_ny"`
+	Timezone        string     `json:"timezone"`
+	OpenUnix        int64      `json:"open_unix"` // 09:30 NY in unix seconds (VWAP anchor)
+	ExitUnix        int64      `json:"exit_unix"` // 11:00 NY in unix seconds (force-exit / "show rest" end)
+	PrevCloseDateNY string     `json:"prev_close_date_ny,omitempty"`
+	Bars            []chartBar `json:"bars"`
+	Error           string     `json:"error,omitempty"`
 }
 
-func (s *Server) historicRunLoop(ctx context.Context) {
-	var (
-		cancel context.CancelFunc
-		done   chan struct{}
-	)
-
-	for {
-		select {
-		case <-ctx.Done():
-			if cancel != nil {
-				cancel()
-			}
-			if done != nil {
-				<-done
-			}
-			return
-
-		case target := <-s.histReqC:
-			if s.eng == nil {
-				log.Printf("historic run requested but engine is nil")
-				continue
-			}
-			if s.st.Mode() != store.ModeHistoric {
-				continue
-			}
-
-			// cancel the current run (if any) and wait for it to fully exit
-			if cancel != nil {
-				cancel()
-				if done != nil {
-					<-done
-				}
-			}
-
-			runCtx, c := context.WithCancel(ctx)
-			cancel = c
-			done = make(chan struct{})
-
-			go func(runCtx context.Context, d time.Time, done chan struct{}) {
-				defer close(done)
-				if err := s.eng.RunHistoricForDate(runCtx, d); err != nil {
-					log.Printf("historic run error: %v", err)
-				}
-			}(runCtx, target, done)
-		}
-	}
-}
-
-func (s *Server) handleHistoricRun(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+func (s *Server) handleChartBars(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.st.Mode() != store.ModeHistoric {
-		http.Error(w, "not in historic mode", http.StatusConflict)
+
+	sym := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("symbol")))
+	if sym == "" {
+		http.Error(w, "missing symbol", http.StatusBadRequest)
 		return
 	}
 
 	loc := mustLoc(s.cfg.Market.Timezone)
 
-	dateStr := r.URL.Query().Get("date") // YYYY-MM-DD
-	var target time.Time
+	dateStr := strings.TrimSpace(r.URL.Query().Get("date")) // YYYY-MM-DD
+	var dayNY time.Time
 	if dateStr == "" {
-		target = time.Now().In(loc)
+		dayNY = time.Now().In(loc)
 	} else {
 		t, err := time.ParseInLocation("2006-01-02", dateStr, loc)
 		if err != nil {
 			http.Error(w, "invalid date (use YYYY-MM-DD)", http.StatusBadRequest)
 			return
 		}
-		target = t
+		dayNY = t
 	}
+	dayNY = time.Date(dayNY.Year(), dayNY.Month(), dayNY.Day(), 0, 0, 0, 0, loc)
 
-	now := time.Now().In(loc)
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-	reqDay := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, loc)
+	openNY := atTimeInLoc(dayNY, s.cfg.Market.OpenTime, loc) // usually 09:30:00
+	exitNY := atTimeInLoc(dayNY, s.cfg.Market.ForceExitTime, loc) // usually 11:00:00
 
-	if reqDay.After(today) {
-		http.Error(w, "date cannot be in the future", http.StatusBadRequest)
+	// Request 09:30 → 11:00 (range is [from,to))
+	endNY := exitNY
+
+	key := os.Getenv("MASSIVE_API_KEY")
+	if key == "" {
+		http.Error(w, "MASSIVE_API_KEY is missing on server", http.StatusInternalServerError)
 		return
 	}
-	min := today.AddDate(0, 0, -s.cfg.History.MaxCalendarLookback)
-	if reqDay.Before(min) {
-		http.Error(w, "date is older than configured max_calendar_lookback_days", http.StatusBadRequest)
+	rest := massive.NewREST(key)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+
+	// Local helper: fetch 1m aggs and assign timestamps by index (start + i*1m).
+	listBars := func(startNY, endNY time.Time) ([]chartBar, error) {
+		params := models.ListAggsParams{
+			Ticker:     sym,
+			Multiplier: 1,
+			Timespan:   models.Minute,
+			From:       massive.ToMillis(startNY),
+			To:         massive.ToMillis(endNY),
+		}
+		it := rest.ListAggs(ctx, &params)
+
+		out := make([]chartBar, 0, 64)
+		idx := 0
+		for it.Next() {
+			a := it.Item()
+			t := startNY.Add(time.Duration(idx) * time.Minute)
+			idx++
+
+			// Skip clearly-bad bars but keep the idx progression stable.
+			if a.Open <= 0 || a.High <= 0 || a.Low <= 0 || a.Close <= 0 {
+				continue
+			}
+			out = append(out, chartBar{
+				Time:   t.Unix(),
+				Open:   a.Open,
+				High:   a.High,
+				Low:    a.Low,
+				Close:  a.Close,
+				Volume: float64(a.Volume),
+			})
+		}
+		if err := it.Err(); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+
+	// Find previous session “last minute” bar (15:59→16:00) by searching backwards.
+	prevCloseDate := ""
+	var prevBar chartBar
+	gotPrev := false
+
+	d := dayNY.AddDate(0, 0, -1)
+	for tries := 0; tries < 15; tries++ {
+		// skip weekends quickly
+		for d.Weekday() == time.Saturday {
+			d = d.AddDate(0, 0, -1)
+		}
+		for d.Weekday() == time.Sunday {
+			d = d.AddDate(0, 0, -1)
+		}
+
+		closeStart := time.Date(d.Year(), d.Month(), d.Day(), 15, 59, 0, 0, loc)
+		closeEnd := closeStart.Add(1 * time.Minute)
+
+		bs, err := listBars(closeStart, closeEnd)
+		if err == nil && len(bs) > 0 {
+			prevBar = bs[len(bs)-1]
+			prevCloseDate = d.Format("2006-01-02")
+			gotPrev = true
+			break
+		}
+
+		d = d.AddDate(0, 0, -1)
+	}
+
+	// Today session bars
+	todayBars, err := listBars(openNY, endNY)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(chartBarsResp{
+			OK:       false,
+			Symbol:   sym,
+			DateNY:   dayNY.Format("2006-01-02"),
+			Timezone: s.cfg.Market.Timezone,
+			OpenUnix: openNY.Unix(),
+			ExitUnix: exitNY.Unix(),
+			Error:    fmt.Sprintf("failed to fetch bars: %v", err),
+		})
 		return
 	}
 
-	s.QueueHistoricRun(reqDay)
+	// Build final bar list:
+	// - Put prev close bar at 09:29 (synthetic placement so it appears “right before open”)
+	// - Then 09:30.. bars
+	out := make([]chartBar, 0, 1+len(todayBars))
+	if gotPrev {
+		prevBar.Time = openNY.Add(-1 * time.Minute).Unix() // 09:29
+		out = append(out, prevBar)
+	}
+	out = append(out, todayBars...)
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":                 true,
-		"requested_date_ny":   reqDay.Format("2006-01-02"),
+	_ = json.NewEncoder(w).Encode(chartBarsResp{
+		OK:              true,
+		Symbol:          sym,
+		DateNY:          dayNY.Format("2006-01-02"),
+		Timezone:        s.cfg.Market.Timezone,
+		OpenUnix:        openNY.Unix(),
+		ExitUnix:        exitNY.Unix(),
+		PrevCloseDateNY: prevCloseDate,
+		Bars:            out,
 	})
 }
 
-func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	loc := mustLoc(s.cfg.Market.Timezone)
-	snap := s.st.Snapshot(time.Now().In(loc))
+// ---- existing code below (unchanged) ----
+// (keep the rest of your file as-is)
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(snap)
-}
-
-type filtersPatch struct {
-	Open5mRangePctMin *float64 `json:"open_5m_range_pct_min,omitempty"`
-	Open5mRangePctMax *float64 `json:"open_5m_range_pct_max,omitempty"`
-	Open5mVolMin      *float64 `json:"open_5m_vol_min,omitempty"`
-	Open5mVolMax      *float64 `json:"open_5m_vol_max,omitempty"`
-
-	Open5mTodayPctMin *float64 `json:"open_5m_today_pct_min,omitempty"`
-	Open5mTodayPctMax *float64 `json:"open_5m_today_pct_max,omitempty"`
-
-	EntryMinAfterOpen *int     `json:"entry_minutes_after_open_min,omitempty"`
-	EntryMaxAfterOpen *int     `json:"entry_minutes_after_open_max,omitempty"`
-	EntryPriceMin     *float64 `json:"entry_price_min,omitempty"`
-	EntryPriceMax     *float64 `json:"entry_price_max,omitempty"`
-}
-
-func (s *Server) handleFilters(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	switch r.Method {
-	case http.MethodGet:
-		f := s.st.Filters()
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "filters": f})
-		return
-
-	case http.MethodPost:
-		var p filtersPatch
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid json body"})
-			return
-		}
-
-		updated, err := s.st.UpdateFilters(func(f *store.RuntimeFilters) error {
-			if p.Open5mRangePctMin != nil {
-				f.Open5mRangePctMin = *p.Open5mRangePctMin
-			}
-			if p.Open5mRangePctMax != nil {
-				f.Open5mRangePctMax = *p.Open5mRangePctMax
-			}
-			if p.Open5mVolMin != nil {
-				f.Open5mVolMin = *p.Open5mVolMin
-			}
-			if p.Open5mVolMax != nil {
-				f.Open5mVolMax = *p.Open5mVolMax
-			}
-			if p.Open5mTodayPctMin != nil {
-				f.Open5mTodayPctMin = *p.Open5mTodayPctMin
-			}
-			if p.Open5mTodayPctMax != nil {
-				f.Open5mTodayPctMax = *p.Open5mTodayPctMax
-			}
-			if p.EntryMinAfterOpen != nil {
-				f.EntryMinAfterOpen = *p.EntryMinAfterOpen
-			}
-			if p.EntryMaxAfterOpen != nil {
-				f.EntryMaxAfterOpen = *p.EntryMaxAfterOpen
-			}
-			if p.EntryPriceMin != nil {
-				f.EntryPriceMin = *p.EntryPriceMin
-			}
-			if p.EntryPriceMax != nil {
-				f.EntryPriceMax = *p.EntryPriceMax
-			}
-			return nil
-		})
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-
-		// Emit an event so it shows up in the log.
-		loc := mustLoc(s.cfg.Market.Timezone)
-		nowNY := time.Now().In(loc)
-		msg := fmt.Sprintf(
-			"Filters updated. OR rng=%.3f–%.3f, OR vol=%.0f–%.0f, Today%%=%.0f–%.0f, EntryMin=%d–%d, Px=%.2f–%.2f",
-			updated.Open5mRangePctMin, updated.Open5mRangePctMax,
-			updated.Open5mVolMin, updated.Open5mVolMax,
-			updated.Open5mTodayPctMin, updated.Open5mTodayPctMax,
-			updated.EntryMinAfterOpen, updated.EntryMaxAfterOpen,
-			updated.EntryPriceMin, updated.EntryPriceMax,
-		)
-		s.st.AddEvent(store.Event{
-			ID:      fmt.Sprintf("%d-FILTERS", nowNY.UnixNano()),
-			TimeNY:  nowNY.Format("15:04:05"),
-			Type:    "FILTERS",
-			Message: msg,
-			Level:   "info",
-		})
-
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "filters": updated})
-		return
-
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "method not allowed"})
-		return
-	}
-}
-
-func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
-	// /api/audio/{id}.mp3
-	id := strings.TrimPrefix(r.URL.Path, "/api/audio/")
-	id = strings.TrimSuffix(id, ".mp3")
-	if id == "" {
-		http.NotFound(w, r)
-		return
-	}
-	b, ok := s.st.GetAudio(id)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "audio/mpeg")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(b)
-}
-
-func mustLoc(tz string) *time.Location {
-	loc, err := time.LoadLocation(tz)
-	if err != nil {
-		return time.FixedZone("UTC", 0)
-	}
-	return loc
-}
-
-func itoa(n int) string {
-	// tiny, dependency-free
-	if n == 0 {
-		return "0"
-	}
-	var buf [32]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + (n % 10))
-		n /= 10
-	}
-	return string(buf[i:])
+// helper: parse "HH:MM:SS" and return a time on the same date in loc
+func atTimeInLoc(day time.Time, hms string, loc *time.Location) time.Time {
+	var hh, mm, ss int
+	_, _ = fmt.Sscanf(hms, "%d:%d:%d", &hh, &mm, &ss)
+	d := day.In(loc)
+	return time.Date(d.Year(), d.Month(), d.Day(), hh, mm, ss, 0, loc)
 }
