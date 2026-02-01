@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -49,6 +50,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.Handle("/api/events", s.hub)
 	mux.HandleFunc("/api/audio/", s.handleAudio)
 	mux.HandleFunc("/api/historic/run", s.handleHistoricRun)
+	mux.HandleFunc("/api/filters", s.handleFilters)
 
 	// Push events to SSE hub by polling store’s event list:
 	// (simple + robust; if you want lower latency, you can refactor Store.AddEvent to call hub.Broadcast directly)
@@ -213,6 +215,106 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(snap)
+}
+
+type filtersPatch struct {
+	Open5mRangePctMin *float64 `json:"open_5m_range_pct_min,omitempty"`
+	Open5mRangePctMax *float64 `json:"open_5m_range_pct_max,omitempty"`
+	Open5mVolMin      *float64 `json:"open_5m_vol_min,omitempty"`
+	Open5mVolMax      *float64 `json:"open_5m_vol_max,omitempty"`
+
+	Open5mTodayPctMin *float64 `json:"open_5m_today_pct_min,omitempty"`
+	Open5mTodayPctMax *float64 `json:"open_5m_today_pct_max,omitempty"`
+
+	EntryMinAfterOpen *int     `json:"entry_minutes_after_open_min,omitempty"`
+	EntryMaxAfterOpen *int     `json:"entry_minutes_after_open_max,omitempty"`
+	EntryPriceMin     *float64 `json:"entry_price_min,omitempty"`
+	EntryPriceMax     *float64 `json:"entry_price_max,omitempty"`
+}
+
+func (s *Server) handleFilters(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		f := s.st.Filters()
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "filters": f})
+		return
+
+	case http.MethodPost:
+		var p filtersPatch
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid json body"})
+			return
+		}
+
+		updated, err := s.st.UpdateFilters(func(f *store.RuntimeFilters) error {
+			if p.Open5mRangePctMin != nil {
+				f.Open5mRangePctMin = *p.Open5mRangePctMin
+			}
+			if p.Open5mRangePctMax != nil {
+				f.Open5mRangePctMax = *p.Open5mRangePctMax
+			}
+			if p.Open5mVolMin != nil {
+				f.Open5mVolMin = *p.Open5mVolMin
+			}
+			if p.Open5mVolMax != nil {
+				f.Open5mVolMax = *p.Open5mVolMax
+			}
+			if p.Open5mTodayPctMin != nil {
+				f.Open5mTodayPctMin = *p.Open5mTodayPctMin
+			}
+			if p.Open5mTodayPctMax != nil {
+				f.Open5mTodayPctMax = *p.Open5mTodayPctMax
+			}
+			if p.EntryMinAfterOpen != nil {
+				f.EntryMinAfterOpen = *p.EntryMinAfterOpen
+			}
+			if p.EntryMaxAfterOpen != nil {
+				f.EntryMaxAfterOpen = *p.EntryMaxAfterOpen
+			}
+			if p.EntryPriceMin != nil {
+				f.EntryPriceMin = *p.EntryPriceMin
+			}
+			if p.EntryPriceMax != nil {
+				f.EntryPriceMax = *p.EntryPriceMax
+			}
+			return nil
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+
+		// Emit an event so it shows up in the log.
+		loc := mustLoc(s.cfg.Market.Timezone)
+		nowNY := time.Now().In(loc)
+		msg := fmt.Sprintf(
+			"Filters updated. OR rng=%.3f–%.3f, OR vol=%.0f–%.0f, Today%%=%.0f–%.0f, EntryMin=%d–%d, Px=%.2f–%.2f",
+			updated.Open5mRangePctMin, updated.Open5mRangePctMax,
+			updated.Open5mVolMin, updated.Open5mVolMax,
+			updated.Open5mTodayPctMin, updated.Open5mTodayPctMax,
+			updated.EntryMinAfterOpen, updated.EntryMaxAfterOpen,
+			updated.EntryPriceMin, updated.EntryPriceMax,
+		)
+		s.st.AddEvent(store.Event{
+			ID:      fmt.Sprintf("%d-FILTERS", nowNY.UnixNano()),
+			TimeNY:  nowNY.Format("15:04:05"),
+			Type:    "FILTERS",
+			Message: msg,
+			Level:   "info",
+		})
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "filters": updated})
+		return
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "method not allowed"})
+		return
+	}
 }
 
 func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {

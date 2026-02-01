@@ -247,10 +247,13 @@ func (e *Engine) onMinuteAgg(openNY, selNY time.Time, agg massive.EquityAgg) {
 	}
 
 	e.st.UpsertTicker(sym, func(t *store.TickerState) {
-		if hhmm == "09:30" && t.Open0930 == 0 {
+		// If we start after 09:30, we may never receive the 09:30 bar.
+		// In that case, initialize Open0930 from the first bar we see and mark as estimated.
+		if t.Open0930 == 0 {
 			t.Open0930 = agg.Open
 			t.ORHigh = agg.High
 			t.ORLow = agg.Low
+			t.Open0930Estimated = (hhmm != "09:30")
 		} else {
 			if agg.High > t.ORHigh {
 				t.ORHigh = agg.High
@@ -264,7 +267,7 @@ func (e *Engine) onMinuteAgg(openNY, selNY time.Time, agg massive.EquityAgg) {
 }
 
 func (e *Engine) selectCandidatesAt0935() []string {
-	cfg := e.cfg
+	f := e.st.Filters()
 
 	nowNY := time.Now().In(e.loc)
 	e.emit(nowNY, "SYSTEM", "", "Computing open_5m_range_pct + open_5m_vol and filtering...", "", "info")
@@ -283,8 +286,8 @@ func (e *Engine) selectCandidatesAt0935() []string {
 		rng := (t.ORHigh - t.ORLow) / t.Open0930
 		vol := t.Open5mVol
 
-		if rng >= cfg.Filters.Open5mRangePctMin && rng <= cfg.Filters.Open5mRangePctMax &&
-			vol >= cfg.Filters.Open5mVolMin && vol <= cfg.Filters.Open5mVolMax {
+		if rng >= f.Open5mRangePctMin && rng <= f.Open5mRangePctMax &&
+			vol >= f.Open5mVolMin && vol <= f.Open5mVolMax {
 
 			candidates = append(candidates, sym)
 
@@ -419,6 +422,7 @@ func (e *Engine) buildTrackedStates(
 
 func (e *Engine) seedVWAPFromTrades(ctx context.Context, rest *mrestClientShim, sym string, startNY, endNY time.Time, ts *store.TickerState) error {
 	it := rest.ListTrades(ctx, sym, startNY, endNY)
+	crossStartNY := startNY.Add(1 * time.Minute) // 09:31 if open is 09:30
 	for it.Next() {
 		select {
 		case <-ctx.Done():
@@ -426,19 +430,48 @@ func (e *Engine) seedVWAPFromTrades(ctx context.Context, rest *mrestClientShim, 
 		default:
 		}
 		tr := it.Item()
-		// models.Trade has Price/Size (float64) and Timestamp (nanos) in the REST models :contentReference[oaicite:8]{index=8}
 		if tr.Price <= 0 || tr.Size <= 0 {
 			continue
 		}
+
+		tsMillis := tradeTimeMillis(tr)
+		if tsMillis == 0 {
+			continue
+		}
+		trNY := time.UnixMilli(tsMillis).In(e.loc)
+
+		// prev values for cross detection (previous trade)
+		prevPrice := ts.LastPrice
+		prevVWAP := ts.VWAP
+
+		// vwap update (trade-level)
 		ts.CumPV += tr.Price * tr.Size
 		ts.CumV += tr.Size
+		if ts.CumV > 0 {
+			ts.VWAP = ts.CumPV / ts.CumV
+		}
+		ts.LastPrice = tr.Price
+		ts.LastTrade = trNY
+
+		// Record first cross-up from below any time in [09:31, 09:35)
+		// (entry itself still won't happen until after 09:35 in processTrade)
+		if !ts.SawCrossInWindow && !trNY.Before(crossStartNY) {
+			cross := prevPrice > 0 && prevVWAP > 0 && prevPrice < prevVWAP && tr.Price >= ts.VWAP
+			if cross {
+				ts.SawCrossInWindow = true
+				ts.FirstCrossTime = trNY
+				ts.FirstCrossPrice = tr.Price
+			}
+		}
 	}
 	if err := it.Err(); err != nil {
 		return err
 	}
+
+	// Ensure the first post-09:35 tick has meaningful "prev" values.
 	if ts.CumV > 0 {
-		ts.VWAP = ts.CumPV / ts.CumV
 		ts.PrevVWAP = ts.VWAP
+		ts.PrevPrice = ts.LastPrice
 	}
 	return nil
 }
@@ -486,10 +519,10 @@ func (e *Engine) avgPrevSessionsOpen5mVol(
 
 // ---- Trades processing (tick data) ----
 func (e *Engine) onTrade(openNY, selNY, cutoffNY, exitNY time.Time, tr massive.EquityTrade) {
-	e.onTradeFields(openNY, selNY, cutoffNY, exitNY, tr.Symbol, tr.Timestamp, tr.Price, float64(tr.Size))
+	e.processTrade(openNY, selNY, cutoffNY, exitNY, tr.Symbol, tr.Timestamp, tr.Price, float64(tr.Size), true)
 }
 
-func (e *Engine) onTradeFields(openNY, selNY, cutoffNY, exitNY time.Time, sym string, tsMillis int64, price float64, size float64) {
+func (e *Engine) processTrade(openNY, selNY, cutoffNY, exitNY time.Time, sym string, tsMillis int64, price float64, size float64, allowActions bool) {
 	if sym == "" {
 		return
 	}
@@ -548,8 +581,36 @@ func (e *Engine) onTradeFields(openNY, selNY, cutoffNY, exitNY time.Time, sym st
 		return
 	}
 
-	// BUY window checks
-	if !ts.HasPosition && !ts.Exited {
+	f := e.st.Filters()
+
+	// ------------------------------------------------------------
+	// Cross detection window (NEW):
+	// - detect cross-ups from below starting at 09:31 (open + 1 min)
+	// - keep detecting until cutoff (09:43)
+	// ------------------------------------------------------------
+	crossStartNY := openNY.Add(1 * time.Minute) // 09:31
+	crossNow := ts.PrevPrice > 0 && ts.PrevVWAP > 0 && ts.PrevPrice < ts.PrevVWAP && price >= ts.VWAP
+
+	sawCross := ts.SawCrossInWindow
+	if !ts.HasPosition && !ts.Exited && !sawCross && crossNow &&
+		!trNY.Before(crossStartNY) && trNY.Before(cutoffNY) {
+		sawCross = true
+		e.st.UpsertTicker(sym, func(t *store.TickerState) {
+			if !t.SawCrossInWindow {
+				t.SawCrossInWindow = true
+				t.FirstCrossTime = trNY
+				t.FirstCrossPrice = price
+			}
+		})
+	}
+
+	// ------------------------------------------------------------
+	// Entry logic (UPDATED):
+	// - entry still ONLY after 09:35 (selNY)
+	// - BUT it can trigger if the cross happened earlier (>=09:31)
+	// - and (NEW) only if price is >= VWAP after 09:35
+	// ------------------------------------------------------------
+	if allowActions && !ts.HasPosition && !ts.Exited {
 		if trNY.Before(selNY) {
 			return
 		}
@@ -557,46 +618,41 @@ func (e *Engine) onTradeFields(openNY, selNY, cutoffNY, exitNY time.Time, sym st
 			return
 		}
 
-		// entry minutes window: 5..12 inclusive
-		if minAfterOpen < float64(e.cfg.Filters.EntryMinAfterOpen) || minAfterOpen > float64(e.cfg.Filters.EntryMaxAfterOpen)+0.999 {
+		// entry minutes window: keep using your config (default 5..12)
+		if minAfterOpen < float64(f.EntryMinAfterOpen) || minAfterOpen > float64(f.EntryMaxAfterOpen)+0.999 {
 			return
-		}
-
-		// detect cross (for diagnostics too)
-		cross := ts.PrevPrice > 0 && ts.PrevVWAP > 0 && ts.PrevPrice < ts.PrevVWAP && price >= ts.VWAP
-		if cross {
-			e.st.UpsertTicker(sym, func(t *store.TickerState) {
-				if !t.SawCrossInWindow {
-					t.SawCrossInWindow = true
-					t.FirstCrossTime = trNY
-					t.FirstCrossPrice = price
-				}
-			})
 		}
 
 		// must meet open metrics + today pct + entry price filters
-		if ts.Open5mRangePct < e.cfg.Filters.Open5mRangePctMin || ts.Open5mRangePct > e.cfg.Filters.Open5mRangePctMax {
+		if ts.Open5mRangePct < f.Open5mRangePctMin || ts.Open5mRangePct > f.Open5mRangePctMax {
 			return
 		}
-		if ts.Open5mVol < e.cfg.Filters.Open5mVolMin || ts.Open5mVol > e.cfg.Filters.Open5mVolMax {
+		if ts.Open5mVol < f.Open5mVolMin || ts.Open5mVol > f.Open5mVolMax {
 			return
 		}
-		if ts.Open5mTodayPct < e.cfg.Filters.Open5mTodayPctMin || ts.Open5mTodayPct > e.cfg.Filters.Open5mTodayPctMax {
+		if ts.Open5mTodayPct < f.Open5mTodayPctMin || ts.Open5mTodayPct > f.Open5mTodayPctMax {
 			return
 		}
-		if price < e.cfg.Filters.EntryPriceMin || price > e.cfg.Filters.EntryPriceMax {
+		if price < f.EntryPriceMin || price > f.EntryPriceMax {
 			return
 		}
 
-		// VWAP cross-up from below:
-		if cross {
+		// NEW: must be at/above VWAP after 09:35
+		aboveVWAP := ts.VWAP > 0 && price >= ts.VWAP
+		if !aboveVWAP {
+			return
+		}
+
+		// Entry triggers if we have seen a cross anytime since 09:31 (to cutoff),
+		// even if the cross happened before 09:35.
+		if sawCross {
 			e.openPosition(trNY, sym, price)
 			return
 		}
 	}
 
 	// manage position
-	if ts.HasPosition && !ts.Exited {
+	if allowActions && ts.HasPosition && !ts.Exited {
 		if price >= ts.TakeProfitPrice && ts.TakeProfitPrice > 0 {
 			e.closePosition(trNY, sym, "PROFIT", fmt.Sprintf("PROFIT! %s", sym), price)
 			return

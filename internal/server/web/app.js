@@ -2,6 +2,26 @@ const $ = (id) => document.getElementById(id);
 
 const player = $("player");
 const audioToggle = $("audioToggle");
+const histPerfToggle = $("histPerfToggle");
+const histPerformanceWrap = $("histPerformanceWrap");
+const noEntryTitle = $("noEntryTitle");
+const noEntryHint = $("noEntryHint");
+
+const nfInt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+
+// Filters UI
+const applyFiltersBtn = $("applyFiltersBtn");
+const filtersStatus = $("filtersStatus");
+const f_or_rng_min = $("f_or_rng_min");
+const f_or_rng_max = $("f_or_rng_max");
+const f_or_vol_min = $("f_or_vol_min");
+const f_or_vol_max = $("f_or_vol_max");
+const f_today_min = $("f_today_min");
+const f_today_max = $("f_today_max");
+const f_entry_min = $("f_entry_min");
+const f_entry_max = $("f_entry_max");
+const f_px_min = $("f_px_min");
+const f_px_max = $("f_px_max");
 
 // Historic controls (exist in DOM even if the card is hidden)
 const historicDateInput = $("historicDate");
@@ -17,6 +37,40 @@ let currentSessionID = null;
 let pendingHistoricRequest = false;
 let histMinISO = "";
 let histMaxISO = "";
+let lastState = null;
+
+// -----------------------------
+// Filters: allow staged edits
+// -----------------------------
+const dirtyFilterIDs = new Set();
+function markFilterDirty(el) {
+  if (!el || !el.id) return;
+  dirtyFilterIDs.add(el.id);
+}
+function clearFilterDirty() {
+  dirtyFilterIDs.clear();
+}
+function isFilterDirty(el) {
+  if (!el || !el.id) return false;
+  return dirtyFilterIDs.has(el.id);
+}
+
+// -----------------------------
+// Historic: performance toggle (persisted)
+// -----------------------------
+let showHistoricPerformance = true;
+try {
+  const saved = localStorage.getItem("orb_show_hist_perf");
+  if (saved !== null) showHistoricPerformance = (saved === "1");
+} catch (_) {}
+if (histPerfToggle) {
+  histPerfToggle.checked = showHistoricPerformance;
+  histPerfToggle.addEventListener("change", () => {
+    showHistoricPerformance = !!histPerfToggle.checked;
+    try { localStorage.setItem("orb_show_hist_perf", showHistoricPerformance ? "1" : "0"); } catch (_) {}
+    if (lastState) renderState(lastState);
+  });
+}
 
 function fmt(n, digits=2) {
   if (n === null || n === undefined) return "—";
@@ -24,6 +78,14 @@ function fmt(n, digits=2) {
   if (!isFinite(n)) return "—";
   return n.toFixed(digits);
 }
+
+function fmtInt(n) {
+  if (n === null || n === undefined) return "—";
+  const x = (typeof n === "number") ? n : Number(n);
+  if (!isFinite(x)) return "—";
+  return nfInt.format(Math.round(x));
+}
+
 function fmtPct(x) {
   if (!isFinite(x)) return "—";
   return (x * 100).toFixed(2) + "%";
@@ -58,6 +120,78 @@ function setHistoricNote(text) {
 function setHistoricControlsDisabled(disabled) {
   for (const el of [historicDateInput, histPrevBtn, histNextBtn, histTodayBtn, histLoadBtn]) {
     if (el) el.disabled = !!disabled;
+  }
+}
+
+function setFiltersStatus(text) {
+  if (!filtersStatus) return;
+  if (!text) {
+    filtersStatus.style.display = "none";
+    filtersStatus.textContent = "";
+    return;
+  }
+  filtersStatus.style.display = "";
+  filtersStatus.textContent = text;
+}
+
+function numVal(el) {
+  if (!el) return null;
+  const s = String(el.value ?? "").trim();
+  if (s === "") return null;
+  const v = Number(s);
+  return isFinite(v) ? v : null;
+}
+function intVal(el) {
+  if (!el) return null;
+  const s = String(el.value ?? "").trim();
+  if (s === "") return null;
+  const v = parseInt(s, 10);
+  return Number.isFinite(v) ? v : null;
+}
+
+async function applyFilters() {
+  const payload = {
+    open_5m_range_pct_min: numVal(f_or_rng_min),
+    open_5m_range_pct_max: numVal(f_or_rng_max),
+    open_5m_vol_min: numVal(f_or_vol_min),
+    open_5m_vol_max: numVal(f_or_vol_max),
+    open_5m_today_pct_min: numVal(f_today_min),
+    open_5m_today_pct_max: numVal(f_today_max),
+    entry_minutes_after_open_min: intVal(f_entry_min),
+    entry_minutes_after_open_max: intVal(f_entry_max),
+    entry_price_min: numVal(f_px_min),
+    entry_price_max: numVal(f_px_max),
+  };
+
+  setFiltersStatus("Saving…");
+  try {
+    const res = await fetch("/api/filters", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      cache: "no-store",
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body?.ok === false) {
+      setFiltersStatus(body?.error || `Failed to update filters (${res.status})`);
+      return;
+    }
+    setFiltersStatus("Saved.");
+    clearFilterDirty();
+    setTimeout(() => setFiltersStatus(""), 1200);
+
+    // Historic UX: re-run the currently selected date so changes apply immediately
+    if (lastState?.mode === "historic") {
+      const fallbackISO =
+        (lastState?.historic_resolved_date_ny || lastState?.historic_target_date_ny || (lastState?.now_ny || "").slice(0, 10));
+      const iso = clampISO(historicDateInput?.value || fallbackISO || histMaxISO);
+      if (iso) {
+        setFiltersStatus("Saved. Replaying historic session…");
+        requestHistoricRun(iso);
+      }
+    }
+  } catch (_) {
+    setFiltersStatus("Failed to update filters (network error).");
   }
 }
 
@@ -190,6 +324,11 @@ function renderHistoric(report, mode, st) {
   }
   card.style.display = "";
 
+  // Show/hide performance tables
+  if (histPerformanceWrap) {
+    histPerformanceWrap.style.display = showHistoricPerformance ? "" : "none";
+  }
+
   // date picker bounds & value
   histMinISO = st.historic_min_date_ny || "";
   histMaxISO = st.historic_max_date_ny || "";
@@ -216,10 +355,70 @@ function renderHistoric(report, mode, st) {
   const note = st.historic_note || "";
   setHistoricNote(note);
 
+  // If we don't have a ready report yet, clear performance tables so old data doesn't linger.
+  // (If performance is OFF, we may still render the "Of interest" list from st.tickers.)
   if (!report || !report.summary) {
-    // still running / not ready yet
+    const sumWrap = $("histSummary");
+    const tb = $("tradesBody");
+    if (sumWrap) sumWrap.innerHTML = "";
+    if (tb) tb.innerHTML = "";
+  }
+
+  // -----------------------------------------
+  // Performance OFF: show "Of interest" list
+  // -----------------------------------------
+  if (!showHistoricPerformance) {
+    if (noEntryTitle) noEntryTitle.textContent = "Of interest (09:35 selected)";
+    if (noEntryHint) noEntryHint.textContent = "All tickers that met the 09:30–09:35 selection filters (Open5m Range% + Open5m Vol).";
+
+    const nb = $("noEntryBody");
+    if (!nb) return;
+    nb.innerHTML = "";
+
+    // Build reason maps from the report if available
+    const reasonBySym = new Map();
+    const tradeBySym = new Map();
+    if (report?.no_entries) {
+      for (const n of report.no_entries) reasonBySym.set(n.symbol, n.reason || "");
+    }
+    if (report?.trades) {
+      for (const t of report.trades) tradeBySym.set(t.symbol, t);
+    }
+
+    const tickers = Array.isArray(st.tickers) ? st.tickers.slice() : [];
+    tickers.sort((a,b) => (a.symbol || "").localeCompare(b.symbol || ""));
+
+    for (const t of tickers) {
+      const sym = t.symbol || "";
+      const tr = tradeBySym.get(sym);
+      const reason =
+        (reasonBySym.get(sym)) ||
+        (tr ? (`Trade: ${tr.exit_reason || "—"}`) : "") ||
+        "";
+
+      const row = document.createElement("tr");
+      row.innerHTML = `
+        <td><strong>${sym}</strong></td>
+        <td>${fmtInt(t.open_5m_vol)}</td>
+        <td>${fmtPct(t.open_5m_range_pct)}</td>
+        <td>${isFinite(t.open_5m_today_pct) ? t.open_5m_today_pct.toFixed(1) + "%" : "—"}</td>
+        <td>${t.saw_cross_in_window ? "Yes" : "No"}</td>
+        <td>${t.first_cross_time_ny || "—"}</td>
+        <td>${(t.first_cross_price > 0) ? fmt(t.first_cross_price, 2) : "—"}</td>
+        <td>${reason || "—"}</td>
+      `;
+      nb.appendChild(row);
+    }
     return;
   }
+
+  // -----------------------------------------
+  // Performance ON: existing historic report
+  // -----------------------------------------
+  if (noEntryTitle) noEntryTitle.textContent = "Selected but no entry";
+  if (noEntryHint) noEntryHint.textContent = "Useful for diagnosing false positives (no VWAP cross in the entry window, Today% filter failures, etc.).";
+
+  if (!report || !report.summary) return;
 
   const s = report.summary;
   const metrics = [
@@ -287,12 +486,12 @@ function renderHistoric(report, mode, st) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><strong>${n.symbol}</strong></td>
-      <td>${fmt(n.open_5m_vol, 0)}</td>
+      <td>${fmtInt(n.open_5m_vol)}</td>
       <td>${fmtPct(n.open_5m_range_pct)}</td>
       <td>${isFinite(n.open_5m_today_pct) ? n.open_5m_today_pct.toFixed(1) + "%" : "—"}</td>
       <td>${n.saw_cross_in_window ? "Yes" : "No"}</td>
       <td>${n.first_cross_time_ny || "—"}</td>
-      <td>${fmt(n.first_cross_price, 4)}</td>
+      <td>${fmt(n.first_cross_price, 2)}</td>
       <td>${n.reason || "—"}</td>
     `;
     nb.appendChild(tr);
@@ -300,6 +499,7 @@ function renderHistoric(report, mode, st) {
 }
 
 function renderState(st) {
+  lastState = st;
   $("now").textContent = st.now_ny;
   $("phase").textContent = st.phase;
   $("watchCount").textContent = st.watchlist_count;
@@ -311,6 +511,27 @@ function renderState(st) {
 
   const mode = st.mode || "realtime";
   $("mode").textContent = mode;
+
+  // Filters UI sync (don't overwrite the field being edited)
+  const f = st.filters || {};
+  const syncInput = (el, v) => {
+    if (!el) return;
+    if (document.activeElement === el) return;
+    if (isFilterDirty(el)) return;
+    if (v === null || v === undefined) return;
+    const s = String(v);
+    if (el.value !== s) el.value = s;
+  };
+  syncInput(f_or_rng_min, f.open_5m_range_pct_min);
+  syncInput(f_or_rng_max, f.open_5m_range_pct_max);
+  syncInput(f_or_vol_min, f.open_5m_vol_min);
+  syncInput(f_or_vol_max, f.open_5m_vol_max);
+  syncInput(f_today_min, f.open_5m_today_pct_min);
+  syncInput(f_today_max, f.open_5m_today_pct_max);
+  syncInput(f_entry_min, f.entry_minutes_after_open_min);
+  syncInput(f_entry_max, f.entry_minutes_after_open_max);
+  syncInput(f_px_min, f.entry_price_min);
+  syncInput(f_px_max, f.entry_price_max);
 
   // New session boundary: clear UI caches so identical event IDs across replays don't get ignored
   if (st.session_id && st.session_id !== currentSessionID) {
@@ -362,7 +583,7 @@ function renderState(st) {
       <td>${fmt(t.vwap, 4)}</td>
       <td>${fmt(t.minutes_after_open, 2)}</td>
       <td>${fmt(t.open_0930, 4)}</td>
-      <td>${fmt(t.open_5m_vol, 0)}</td>
+      <td>${fmtInt(t.open_5m_vol)}</td>
       <td>${fmtPct(t.open_5m_range_pct)}</td>
       <td>${isFinite(t.open_5m_today_pct) ? t.open_5m_today_pct.toFixed(1) + "%" : "—"}</td>
       <td>${fmt(t.entry_price, 4)}</td>
@@ -384,6 +605,22 @@ async function loop() {
 $("testAudioBtn").addEventListener("click", () => {
   addEvent({ time_ny:"—", type:"TEST", message:"(Audio fires on BUY/PROFIT/STOP/11AM if OPENAI_API_KEY is set and mode is realtime.)" });
 });
+
+if (applyFiltersBtn) {
+  applyFiltersBtn.addEventListener("click", applyFilters);
+}
+
+// Mark filter fields dirty on edit so the 1s poll doesn't overwrite staged changes
+for (const el of [
+  f_or_rng_min, f_or_rng_max,
+  f_or_vol_min, f_or_vol_max,
+  f_today_min, f_today_max,
+  f_entry_min, f_entry_max,
+  f_px_min, f_px_max,
+]) {
+  if (!el) continue;
+  el.addEventListener("input", () => markFilterDirty(el));
+}
 
 // Historic control wiring
 if (historicDateInput) {

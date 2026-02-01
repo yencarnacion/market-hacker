@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/massive-com/client-go/v2/rest/models"
+	massivews "github.com/massive-com/client-go/v2/websocket"
 
 	"massive-orb/internal/massive"
 	"massive-orb/internal/store"
@@ -19,6 +20,302 @@ func (e *Engine) RunHistoric(ctx context.Context) error {
 	// Preserve existing behavior: "today", but now with market-closed resolution.
 	nowNY := time.Now().In(e.loc)
 	return e.RunHistoricForDate(ctx, nowNY)
+}
+
+// correctCandidatesOpen5mViaREST re-fetches the official 09:30–09:35 bars for the selected tickers only,
+// then re-applies the current open5m filters. This is used in "start after 09:30" scenarios to avoid
+// REST-calling the full watchlist but still make final candidates accurate.
+func (e *Engine) correctCandidatesOpen5mViaREST(ctx context.Context, rest *mrestClientShim, openNY, selNY time.Time, candidates []string) ([]string, error) {
+	if len(candidates) == 0 {
+		return candidates, nil
+	}
+
+	f := e.st.Filters()
+
+	type res struct {
+		sym string
+		o   float64
+		hi  float64
+		lo  float64
+		vol float64
+		ok  bool
+		err error
+	}
+
+	jobs := make(chan string)
+	results := make(chan res)
+
+	workerN := e.cfg.History.MaxWorkers
+	if workerN < 1 {
+		workerN = 1
+	}
+	if workerN > len(candidates) {
+		workerN = len(candidates)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerN; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sym := range jobs {
+				o, hi, lo, vol, ok, err := rest.Open5mMetrics(ctx, sym, openNY, selNY)
+				results <- res{sym: sym, o: o, hi: hi, lo: lo, vol: vol, ok: ok, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, sym := range candidates {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- sym:
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	out := make([]string, 0, len(candidates))
+	for r := range results {
+		if r.err != nil || !r.ok || r.o <= 0 || r.hi <= 0 || r.lo <= 0 {
+			continue
+		}
+		rng := (r.hi - r.lo) / r.o
+
+		e.st.UpsertTicker(r.sym, func(t *store.TickerState) {
+			t.Open0930 = r.o
+			t.Open0930Estimated = false
+			t.ORHigh = r.hi
+			t.ORLow = r.lo
+			t.Open5mVol = r.vol
+			t.Open5mRangePct = rng
+		})
+
+		if rng >= f.Open5mRangePctMin && rng <= f.Open5mRangePctMax &&
+			r.vol >= f.Open5mVolMin && r.vol <= f.Open5mVolMax {
+			out = append(out, r.sym)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// runHistoricLiveToday:
+// If the requested session is "today" and current time is before the configured 11:00 force exit,
+// we replay/catch-up what we can with REST (without emitting past BUY/SELL actions),
+// then switch to live websockets and run until 11:00.
+func (e *Engine) runHistoricLiveToday(ctx context.Context, rest *mrestClientShim, sessionDayNY time.Time, openNY, selNY, cutoffNY, exitNY time.Time) error {
+	// Wait for open if needed
+	nowNY := time.Now().In(e.loc)
+	if nowNY.Before(openNY) {
+		e.st.SetPhase(store.PhaseWaitingOpen)
+		e.emit(nowNY, "SYSTEM", "", fmt.Sprintf("HISTORIC-LIVE: waiting for open at %s", openNY.Format("15:04:05")), "", "info")
+		timer := time.NewTimer(time.Until(openNY))
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+		}
+	}
+
+	// Phase 1: collect open-5m metrics
+	nowNY = time.Now().In(e.loc)
+	if nowNY.Before(selNY) {
+		e.st.SetPhase(store.PhaseCollecting5m)
+		e.emit(nowNY, "SYSTEM", "", "HISTORIC-LIVE: collecting minute bars via WebSocket until 09:35…", "", "info")
+
+		wsAgg, err := massive.NewWS(e.massiveKey, e.cfg.Massive.Feed)
+		if err != nil {
+			return err
+		}
+		defer wsAgg.Close()
+
+		wl := e.st.Watchlist()
+		for i := 0; i < len(wl); i += e.cfg.Massive.WSBatchSize {
+			j := i + e.cfg.Massive.WSBatchSize
+			if j > len(wl) {
+				j = len(wl)
+			}
+			if err := wsAgg.Subscribe(massivews.StocksMinAggs, wl[i:j]...); err != nil {
+				return fmt.Errorf("subscribe minute aggs: %w", err)
+			}
+		}
+		if err := wsAgg.Connect(); err != nil {
+			return fmt.Errorf("ws connect: %w", err)
+		}
+
+		done0935 := make(chan struct{})
+		go func() {
+			defer close(done0935)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case err, ok := <-wsAgg.Error():
+					if !ok {
+						return
+					}
+					if err != nil {
+						e.emit(time.Now().In(e.loc), "SYSTEM", "", fmt.Sprintf("WS error: %v", err), "", "warn")
+						return
+					}
+				case msg, ok := <-wsAgg.Output():
+					if !ok {
+						return
+					}
+					agg, ok := msg.(massive.EquityAgg)
+					if !ok {
+						continue
+					}
+					e.onMinuteAgg(openNY, selNY, agg)
+				}
+			}
+		}()
+
+		timer := time.NewTimer(time.Until(selNY))
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+		}
+		wsAgg.Close()
+		<-done0935
+	} else {
+		e.st.SetPhase(store.PhaseCollecting5m)
+		e.emit(nowNY, "SYSTEM", "", "HISTORIC-LIVE: started after 09:35 — fetching 09:30–09:34 minute bars via REST…", "", "info")
+		if err := e.collectOpen5mViaREST(ctx, rest, openNY, selNY); err != nil {
+			return err
+		}
+	}
+
+	// Candidate selection
+	e.st.SetPhase(store.PhaseSelecting0935)
+	candidates := e.selectCandidatesAt0935()
+	if len(candidates) == 0 {
+		e.emit(time.Now().In(e.loc), "SYSTEM", "", "No tickers matched open_5m filters at 09:35.", "", "info")
+		e.st.SetPhase(store.PhaseClosed)
+		rep := e.buildHistoricReport(sessionDayNY, openNY, selNY, cutoffNY, exitNY, time.Now().In(e.loc))
+		e.st.SetHistoricReport(&rep)
+		return nil
+	}
+
+	// If we started after 09:30 and Open0930 may be estimated, correct candidates only (cheap).
+	corrected, _ := e.correctCandidatesOpen5mViaREST(ctx, rest, openNY, selNY, candidates)
+	if len(corrected) == 0 {
+		e.emit(time.Now().In(e.loc), "SYSTEM", "", "After REST correction, no tickers matched open_5m filters.", "", "info")
+		e.st.SetPhase(store.PhaseClosed)
+		rep := e.buildHistoricReport(sessionDayNY, openNY, selNY, cutoffNY, exitNY, time.Now().In(e.loc))
+		e.st.SetHistoricReport(&rep)
+		return nil
+	}
+	candidates = corrected
+
+	e.emit(time.Now().In(e.loc), "SYSTEM", "", fmt.Sprintf("09:35 selection: %d tickers matched (live tracking to 11:00).", len(candidates)), "", "info")
+
+	tracked, err := e.buildTrackedStates(ctx, rest, openNY, selNY, candidates)
+	if err != nil {
+		return err
+	}
+	e.st.SetTrackedTickers(tracked)
+	e.st.SetPhase(store.PhaseTrackingTicks)
+
+	// Catch up trades from 09:35 -> now, but DO NOT open/close positions retroactively.
+	nowNY = time.Now().In(e.loc)
+	syms := make([]string, 0, len(tracked))
+	for sym := range tracked {
+		syms = append(syms, sym)
+	}
+	sort.Strings(syms)
+	if nowNY.After(selNY) {
+		e.emit(nowNY, "SYSTEM", "", fmt.Sprintf("Catch-up (no actions): replaying trades via REST (%s → %s) for %d tickers…",
+			selNY.Format("15:04:05"), nowNY.Format("15:04:05"), len(syms)), "", "info")
+		for _, sym := range syms {
+			it := rest.ListTrades(ctx, sym, selNY, nowNY)
+			for it.Next() {
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+				}
+				tr := it.Item()
+				tsMillis := tradeTimeMillis(tr)
+				if tsMillis == 0 {
+					continue
+				}
+				e.processTrade(openNY, selNY, cutoffNY, exitNY, sym, tsMillis, tr.Price, tr.Size, false)
+			}
+			_ = it.Err()
+		}
+	}
+
+	// Live trades via WebSocket until 11:00
+	wsTrades, err := massive.NewWS(e.massiveKey, e.cfg.Massive.Feed)
+	if err != nil {
+		return err
+	}
+	defer wsTrades.Close()
+
+	if err := wsTrades.Subscribe(massivews.StocksTrades, syms...); err != nil {
+		return fmt.Errorf("subscribe trades: %w", err)
+	}
+	if err := wsTrades.Connect(); err != nil {
+		return fmt.Errorf("ws trades connect: %w", err)
+	}
+
+	closed11am := make(chan struct{})
+	go func() {
+		defer close(closed11am)
+		now := time.Now().In(e.loc)
+		if now.Before(exitNY) {
+			t := time.NewTimer(time.Until(exitNY))
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+		e.onElevenAM(exitNY)
+	}()
+
+	e.emit(time.Now().In(e.loc), "SYSTEM", "", "HISTORIC-LIVE: tracking live trades (VWAP cross logic active)…", "", "info")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-closed11am:
+			e.st.SetPhase(store.PhaseClosed)
+			rep := e.buildHistoricReport(sessionDayNY, openNY, selNY, cutoffNY, exitNY, exitNY)
+			e.st.SetHistoricReport(&rep)
+			e.emit(time.Now().In(e.loc), "SYSTEM", "", "Historic report ready (see the web UI).", "", "info")
+			return nil
+		case err, ok := <-wsTrades.Error():
+			if !ok {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+		case msg, ok := <-wsTrades.Output():
+			if !ok {
+				return nil
+			}
+			tr, ok := msg.(massive.EquityTrade)
+			if !ok {
+				continue
+			}
+			e.onTrade(openNY, selNY, cutoffNY, exitNY, tr)
+		}
+	}
 }
 
 // RunHistoricForDate replays the ORB session for the requested date (NY).
@@ -44,6 +341,21 @@ func (e *Engine) RunHistoricForDate(ctx context.Context, targetDateNY time.Time)
 	selNY := atTime(resolvedDayNY, e.cfg.Market.SelectionTime, e.loc)
 	cutoffNY := atTime(resolvedDayNY, e.cfg.Market.VWAPCrossCutoff, e.loc)
 	exitNY := atTime(resolvedDayNY, e.cfg.Market.ForceExitTime, e.loc)
+
+	// NEW: If "today" and before 11:00, switch to hybrid live mode:
+	// - collect open5m (WS if before 09:35, otherwise REST)
+	// - catch-up trades to now (no retro actions)
+	// - run live to 11:00
+	if sameDayInLoc(resolvedDayNY, asOfNY, e.loc) && asOfNY.Before(exitNY) {
+		e.st.SetTimes(openNY, selNY, cutoffNY, exitNY)
+		e.st.SetPhase(store.PhaseCollecting5m)
+		e.emit(asOfNY, "SYSTEM", "", fmt.Sprintf("HISTORIC-LIVE mode: %s (live until %s).", resolvedDayNY.Format("2006-01-02"), exitNY.Format("15:04:05")), "", "info")
+		if note != "" {
+			e.emit(asOfNY, "SYSTEM", "", note, "", "info")
+		}
+		e.emit(asOfNY, "SYSTEM", "", "Audio alerts disabled in historic mode.", "", "info")
+		return e.runHistoricLiveToday(ctx, rest, resolvedDayNY, openNY, selNY, cutoffNY, exitNY)
+	}
 
 	// IMPORTANT: avoid lookahead only when replaying "today".
 	endNY := exitNY
@@ -123,7 +435,7 @@ func (e *Engine) RunHistoricForDate(ctx context.Context, targetDateNY time.Time)
 			if tsMillis == 0 {
 				continue
 			}
-			e.onTradeFields(openNY, selNY, cutoffNY, endNY, sym, tsMillis, tr.Price, tr.Size)
+			e.processTrade(openNY, selNY, cutoffNY, endNY, sym, tsMillis, tr.Price, tr.Size, true)
 		}
 		if err := it.Err(); err != nil {
 			e.emit(time.Now().In(e.loc), "SYSTEM", sym, fmt.Sprintf("trade replay failed: %v", err), "", "warn")
@@ -351,6 +663,8 @@ func tradeTimeMillis(tr models.Trade) int64 {
 }
 
 func (e *Engine) buildHistoricReport(sessionDateNY, openNY, selNY, cutoffNY, exitNY, endNY time.Time) store.HistoricReport {
+	f := e.st.Filters()
+
 	states := e.st.TickerStates()
 
 	trades := make([]store.HistoricTrade, 0, 32)
@@ -473,10 +787,12 @@ func (e *Engine) buildHistoricReport(sessionDateNY, openNY, selNY, cutoffNY, exi
 			// Selected but no entry
 			reason := ""
 			if !t.SawCrossInWindow {
-				reason = "No VWAP cross in entry window"
-			} else if t.Open5mTodayPct < e.cfg.Filters.Open5mTodayPctMin || t.Open5mTodayPct > e.cfg.Filters.Open5mTodayPctMax {
+				start := openNY.Add(1 * time.Minute).Format("15:04")
+				end := cutoffNY.Format("15:04")
+				reason = fmt.Sprintf("No VWAP cross between %s and %s", start, end)
+			} else if t.Open5mTodayPct < f.Open5mTodayPctMin || t.Open5mTodayPct > f.Open5mTodayPctMax {
 				reason = "Open5mToday% filter failed"
-			} else if t.FirstCrossPrice > 0 && (t.FirstCrossPrice < e.cfg.Filters.EntryPriceMin || t.FirstCrossPrice > e.cfg.Filters.EntryPriceMax) {
+			} else if t.FirstCrossPrice > 0 && (t.FirstCrossPrice < f.EntryPriceMin || t.FirstCrossPrice > f.EntryPriceMax) {
 				reason = "VWAP cross occurred but price filter failed"
 			} else {
 				reason = "No entry (filters + cross never aligned)"

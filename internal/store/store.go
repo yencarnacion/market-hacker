@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -24,6 +25,23 @@ const (
 	ModeRealtime Mode = "realtime"
 	ModeHistoric Mode = "historic"
 )
+
+// RuntimeFilters are editable at runtime via the web UI.
+// Initialized from config.yaml at startup, then mutable.
+type RuntimeFilters struct {
+	Open5mRangePctMin float64 `json:"open_5m_range_pct_min"`
+	Open5mRangePctMax float64 `json:"open_5m_range_pct_max"`
+	Open5mVolMin      float64 `json:"open_5m_vol_min"`
+	Open5mVolMax      float64 `json:"open_5m_vol_max"`
+
+	Open5mTodayPctMin float64 `json:"open_5m_today_pct_min"`
+	Open5mTodayPctMax float64 `json:"open_5m_today_pct_max"`
+
+	EntryMinAfterOpen int     `json:"entry_minutes_after_open_min"`
+	EntryMaxAfterOpen int     `json:"entry_minutes_after_open_max"`
+	EntryPriceMin     float64 `json:"entry_price_min"`
+	EntryPriceMax     float64 `json:"entry_price_max"`
+}
 
 type HistoricSummary struct {
 	DateNY        string  `json:"date_ny"`
@@ -119,6 +137,10 @@ type PublicTicker struct {
 	Open5mRangePct    float64 `json:"open_5m_range_pct"`
 	Prev10AvgOpen5m   float64 `json:"prev10_avg_open5m_vol"`
 	Open5mTodayPct    float64 `json:"open_5m_today_pct"`
+
+	SawCrossInWindow  bool    `json:"saw_cross_in_window"`
+	FirstCrossTimeNY  string  `json:"first_cross_time_ny,omitempty"`
+	FirstCrossPrice   float64 `json:"first_cross_price"`
 	VWAP              float64 `json:"vwap"`
 	LastPrice         float64 `json:"last_price"`
 	MinutesAfterOpen  float64 `json:"minutes_after_open"`
@@ -133,6 +155,8 @@ type TickerState struct {
 
 	// open-5m metrics (09:30-09:34)
 	Open0930 float64
+	// true if Open0930 was estimated from the first minute bar we saw (when starting after 09:30)
+	Open0930Estimated bool
 	ORHigh   float64
 	ORLow    float64
 	Open5mVol float64
@@ -190,6 +214,8 @@ type Store struct {
 	mode Mode
 	historicReport *HistoricReport
 
+	filters RuntimeFilters
+
 	// increments/changes whenever we start a new historic replay so the UI can reset
 	sessionID string
 	historicTargetDateNY   time.Time
@@ -225,6 +251,7 @@ type Snapshot struct {
 	ForceExitNY     string        `json:"force_exit_ny"`
 	TrackedCount    int           `json:"tracked_count"`
 	Tickers         []PublicTicker `json:"tickers"`
+	Filters         RuntimeFilters `json:"filters"`
 	Events          []Event       `json:"events"`
 	HistoricReport  *HistoricReport `json:"historic_report,omitempty"`
 
@@ -236,6 +263,40 @@ type Snapshot struct {
 	HistoricMaxDateNY      string `json:"historic_max_date_ny,omitempty"`
 }
 
+func runtimeFiltersFromConfig(cfg config.Config) RuntimeFilters {
+	return RuntimeFilters{
+		Open5mRangePctMin: cfg.Filters.Open5mRangePctMin,
+		Open5mRangePctMax: cfg.Filters.Open5mRangePctMax,
+		Open5mVolMin:      cfg.Filters.Open5mVolMin,
+		Open5mVolMax:      cfg.Filters.Open5mVolMax,
+		Open5mTodayPctMin: cfg.Filters.Open5mTodayPctMin,
+		Open5mTodayPctMax: cfg.Filters.Open5mTodayPctMax,
+		EntryMinAfterOpen: cfg.Filters.EntryMinAfterOpen,
+		EntryMaxAfterOpen: cfg.Filters.EntryMaxAfterOpen,
+		EntryPriceMin:     cfg.Filters.EntryPriceMin,
+		EntryPriceMax:     cfg.Filters.EntryPriceMax,
+	}
+}
+
+func validateRuntimeFilters(f RuntimeFilters) error {
+	if f.Open5mRangePctMin <= 0 || f.Open5mRangePctMax <= 0 || f.Open5mRangePctMax < f.Open5mRangePctMin {
+		return fmt.Errorf("open_5m_range_pct_min/max invalid")
+	}
+	if f.Open5mVolMax < f.Open5mVolMin {
+		return fmt.Errorf("open_5m_vol_min/max invalid")
+	}
+	if f.Open5mTodayPctMax < f.Open5mTodayPctMin {
+		return fmt.Errorf("open_5m_today_pct_min/max invalid")
+	}
+	if f.EntryMaxAfterOpen < f.EntryMinAfterOpen {
+		return fmt.Errorf("entry_minutes_after_open_min/max invalid")
+	}
+	if f.EntryPriceMax < f.EntryPriceMin {
+		return fmt.Errorf("entry_price_min/max invalid")
+	}
+	return nil
+}
+
 func New(cfg config.Config, watchlist []string) *Store {
 	ws := make(map[string]struct{}, len(watchlist))
 	for _, s := range watchlist {
@@ -244,6 +305,7 @@ func New(cfg config.Config, watchlist []string) *Store {
 	return &Store{
 		cfg:       cfg,
 		mode:      ModeRealtime,
+		filters:   runtimeFiltersFromConfig(cfg),
 		sessionID: strconv.FormatInt(time.Now().UnixNano(), 10),
 		phase:     PhaseWaitingOpen,
 		watchlist: watchlist,
@@ -266,6 +328,29 @@ func (s *Store) Mode() Mode {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.mode
+}
+
+func (s *Store) Filters() RuntimeFilters {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.filters
+}
+
+// UpdateFilters applies a patch function atomically with validation.
+func (s *Store) UpdateFilters(fn func(f *RuntimeFilters) error) (RuntimeFilters, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur := s.filters
+	next := cur
+	if err := fn(&next); err != nil {
+		return cur, err
+	}
+	if err := validateRuntimeFilters(next); err != nil {
+		return cur, err
+	}
+	s.filters = next
+	return next, nil
 }
 
 func (s *Store) SetHistoricReport(r *HistoricReport) {
@@ -416,6 +501,12 @@ func (s *Store) Snapshot(nowNY time.Time) Snapshot {
 			Open5mRangePct:   t.Open5mRangePct,
 			Prev10AvgOpen5m:  t.Prev10AvgOpen5mVol,
 			Open5mTodayPct:   t.Open5mTodayPct,
+			SawCrossInWindow: t.SawCrossInWindow,
+			FirstCrossTimeNY: func() string {
+				if t.FirstCrossTime.IsZero() { return "" }
+				return t.FirstCrossTime.In(nowNY.Location()).Format("15:04:05")
+			}(),
+			FirstCrossPrice:  t.FirstCrossPrice,
 			VWAP:             t.VWAP,
 			LastPrice:        t.LastPrice,
 			MinutesAfterOpen: t.MinutesAfterOpen,
@@ -463,6 +554,7 @@ func (s *Store) Snapshot(nowNY time.Time) Snapshot {
 		ForceExitNY:     s.forceExitNY.Format("2006-01-02 15:04:05"),
 		TrackedCount:    len(s.tickers),
 		Tickers:         tickers,
+		Filters:         s.filters,
 		Events:          events,
 		HistoricReport:  rep,
 
