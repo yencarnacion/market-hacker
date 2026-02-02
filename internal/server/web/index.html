@@ -221,6 +221,31 @@
 
       <h2 id="soldOffTitle" style="margin-top:14px">Sold off by 10:30</h2>
       <div id="soldOffHint" class="hint">Down hard from the open by 10:30 (historic scan).</div>
+
+      <!-- NEW: Sold-off charts slideshow controls -->
+      <div id="soldChartsToolbar" class="charts-toolbar" style="display:none">
+        <button id="showSoldChartsBtn" class="btn">Show Charts</button>
+        <button id="soldChartPrevBtn" class="btn btn-icon" title="Previous chart">◀</button>
+        <button id="soldChartNextBtn" class="btn btn-icon" title="Next chart">▶</button>
+        <select id="soldChartTickerSelect" class="date-input" style="min-width:120px"></select>
+        <div id="soldChartCounter" class="hint" style="margin:0"></div>
+      </div>
+
+      <div id="soldChartPanel" class="chart-panel" style="display:none">
+        <div class="chart-head">
+          <div>
+            <div id="soldChartSym" class="chart-sym">—</div>
+            <div id="soldChartMeta" class="hint" style="margin:0"></div>
+          </div>
+          <div class="chart-actions">
+            <button id="soldChartNextBarBtn" class="btn">Show next</button>
+            <button id="soldChartRevealBtn" class="btn">Show Rest</button>
+            <button id="hideSoldChartsBtn" class="btn">Hide</button>
+          </div>
+        </div>
+        <div id="soldChartContainer" class="chart-container"></div>
+      </div>
+
       <div class="table-wrap">
         <table>
           <thead>

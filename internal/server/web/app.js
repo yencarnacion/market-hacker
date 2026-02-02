@@ -23,6 +23,21 @@ const chartMeta = $("chartMeta");
 const chartRevealBtn = $("chartRevealBtn");
 const chartNextBarBtn = $("chartNextBarBtn");
 
+// Sold-off charts (Historic slideshow)
+const soldChartsToolbar = $("soldChartsToolbar");
+const showSoldChartsBtn = $("showSoldChartsBtn");
+const hideSoldChartsBtn = $("hideSoldChartsBtn");
+const soldChartPrevBtn = $("soldChartPrevBtn");
+const soldChartNextBtn = $("soldChartNextBtn");
+const soldChartTickerSelect = $("soldChartTickerSelect");
+const soldChartCounter = $("soldChartCounter");
+const soldChartPanel = $("soldChartPanel");
+const soldChartContainer = $("soldChartContainer");
+const soldChartSym = $("soldChartSym");
+const soldChartMeta = $("soldChartMeta");
+const soldChartRevealBtn = $("soldChartRevealBtn");
+const soldChartNextBarBtn = $("soldChartNextBarBtn");
+
 // Sold-off section
 const soldOffTitle = $("soldOffTitle");
 const soldOffHint = $("soldOffHint");
@@ -94,6 +109,35 @@ let lwVWAP = null;
 let lwVolume = null;
 let lwOnResize = null;
 let chartsTimeZone = "America/New_York";
+
+// -----------------------------
+// Sold-off charts state (Historic slideshow)
+// -----------------------------
+let soldChartsOpen = false;
+let soldChartIndex = 0;
+
+// lightweight-charts instances (sold-off)
+let soldLWChart = null;
+let soldLwCandle = null;
+let soldLwSMA = null;
+let soldLwVWAP = null;
+let soldLwVolume = null;
+let soldLwOnResize = null;
+
+// "Guess then reveal" state (sold-off)
+let soldCurrentChartKey = ""; // `${chartsDateISO}:${symbol}`
+let soldCurrentChartPayload = null;
+let soldCurrentChartBars = null;
+let soldCurrentChartOpenUnix = 0;
+let soldCurrentChartShownN = 0;
+let soldCurrentChartFull = null;
+let soldCurrentChartSep = null;
+
+// Separator overlay (sold-off)
+let soldBoundaryCanvas = null;
+let soldBoundaryT0 = null;
+let soldBoundaryT1 = null;
+let soldBoundaryHandler = null;
 
 // -----------------------------
 // "Guess then reveal" state
@@ -418,6 +462,21 @@ function resetChartsState() {
   boundaryT1 = null;
   hideChartsUI(true);
   setChartsToolbarVisible(false);
+
+  // Sold-off chart widget reset
+  soldChartsOpen = false;
+  soldChartIndex = 0;
+  soldCurrentChartKey = "";
+  soldCurrentChartPayload = null;
+  soldCurrentChartBars = null;
+  soldCurrentChartOpenUnix = 0;
+  soldCurrentChartShownN = 0;
+  soldCurrentChartFull = null;
+  soldCurrentChartSep = null;
+  soldBoundaryT0 = null;
+  soldBoundaryT1 = null;
+  soldHideChartsUI(true);
+  soldSetChartsToolbarVisible(false);
 }
 
 function setChartsToolbarVisible(visible) {
@@ -860,6 +919,335 @@ async function showChartAt(idx) {
   }
 }
 
+// -----------------------------
+// Sold-off charts (Historic slideshow) – independent widget
+// -----------------------------
+function soldSetChartsToolbarVisible(visible) {
+  if (!soldChartsToolbar) return;
+  soldChartsToolbar.style.display = visible ? "" : "none";
+}
+
+function soldHideChartsUI(destroy = false) {
+  if (soldChartPanel) soldChartPanel.style.display = "none";
+  if (soldChartMeta) soldChartMeta.textContent = "";
+  if (soldChartSym) soldChartSym.textContent = "—";
+  if (destroy) soldDestroyLWChart();
+}
+
+function soldDestroyLWChart() {
+  if (soldLwOnResize) {
+    window.removeEventListener("resize", soldLwOnResize);
+    soldLwOnResize = null;
+  }
+  if (soldLWChart && soldBoundaryHandler) {
+    try {
+      const ts = soldLWChart.timeScale && soldLWChart.timeScale();
+      if (ts && ts.unsubscribeVisibleLogicalRangeChange) {
+        ts.unsubscribeVisibleLogicalRangeChange(soldBoundaryHandler);
+      }
+    } catch (_) {}
+  }
+  soldBoundaryHandler = null;
+  soldBoundaryT0 = null;
+  soldBoundaryT1 = null;
+  soldBoundaryCanvas = null;
+
+  if (soldLWChart) {
+    soldLWChart.remove();
+    soldLWChart = null;
+  }
+  soldLwCandle = soldLwSMA = soldLwVWAP = soldLwVolume = null;
+  if (soldChartContainer) soldChartContainer.innerHTML = "";
+}
+
+function soldEnsureBoundaryCanvas() {
+  if (!soldChartContainer) return null;
+  if (soldBoundaryCanvas && soldBoundaryCanvas.isConnected) return soldBoundaryCanvas;
+  soldBoundaryCanvas = document.createElement("canvas");
+  soldBoundaryCanvas.style.position = "absolute";
+  soldBoundaryCanvas.style.inset = "0";
+  soldBoundaryCanvas.style.pointerEvents = "none";
+  soldBoundaryCanvas.style.zIndex = "999";
+  soldChartContainer.appendChild(soldBoundaryCanvas);
+  return soldBoundaryCanvas;
+}
+
+function soldClearBoundaryLine() {
+  soldBoundaryT0 = null;
+  soldBoundaryT1 = null;
+  if (!soldBoundaryCanvas) return;
+  const c = soldBoundaryCanvas.getContext("2d");
+  if (!c) return;
+  c.clearRect(0, 0, soldBoundaryCanvas.width, soldBoundaryCanvas.height);
+}
+
+function soldRedrawBoundaryLine() {
+  if (!soldLWChart || !soldChartContainer) return;
+  if (!soldBoundaryT0 || !soldBoundaryT1) return;
+
+  const canvas = soldEnsureBoundaryCanvas();
+  if (!canvas) return;
+
+  const rect = soldChartContainer.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(rect.width));
+  const h = Math.max(1, Math.floor(rect.height));
+
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+  canvas.width = Math.floor(w * dpr);
+  canvas.height = Math.floor(h * dpr);
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  let x0 = null;
+  let x1 = null;
+  try {
+    x0 = soldLWChart.timeScale().timeToCoordinate(soldBoundaryT0);
+    x1 = soldLWChart.timeScale().timeToCoordinate(soldBoundaryT1);
+  } catch (_) {}
+  if (x0 === null || x0 === undefined) return;
+  if (x1 === null || x1 === undefined) return;
+
+  const x = (x0 + x1) / 2;
+  ctx.save();
+  ctx.strokeStyle = "rgba(255, 0, 255, 0.95)";
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  ctx.setLineDash([1, 7]);
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, h);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function soldSetBoundaryLineBetween(t0, t1) {
+  soldBoundaryT0 = t0 || null;
+  soldBoundaryT1 = t1 || null;
+  if (!soldBoundaryT0 || !soldBoundaryT1) {
+    soldClearBoundaryLine();
+    return;
+  }
+  soldRedrawBoundaryLine();
+}
+
+function soldEnsureLWChart() {
+  if (!soldChartContainer) return false;
+  if (!window.LightweightCharts) {
+    if (soldChartMeta) soldChartMeta.textContent = "Lightweight Charts failed to load (CDN blocked?).";
+    return false;
+  }
+  if (soldLWChart) return true;
+
+  soldChartContainer.innerHTML = "";
+  soldBoundaryCanvas = null;
+  soldBoundaryT0 = null;
+  soldBoundaryT1 = null;
+
+  const width = soldChartContainer.clientWidth || 900;
+  const height = soldChartContainer.clientHeight || 520;
+  const VOLUME_HEIGHT = 0.25;
+  const BAR_SPACING_PX = 10;
+
+  const timeFormatter = (unixSec) => {
+    try {
+      const dt = new Date(unixSec * 1000);
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: chartsTimeZone || "America/New_York",
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+      }).format(dt);
+    } catch (_) {
+      return "";
+    }
+  };
+
+  soldLWChart = LightweightCharts.createChart(soldChartContainer, {
+    width,
+    height,
+    layout: { background: { type: "solid", color: "#0b1020" }, textColor: "#e2e2e2" },
+    grid: {
+      vertLines: { color: "rgba(255,255,255,0.06)" },
+      horzLines: { color: "rgba(255,255,255,0.06)" },
+    },
+    rightPriceScale: {
+      borderColor: "rgba(255,255,255,0.10)",
+      scaleMargins: { top: 0.06, bottom: VOLUME_HEIGHT },
+    },
+    timeScale: {
+      timeVisible: true,
+      secondsVisible: false,
+      borderColor: "rgba(255,255,255,0.10)",
+      barSpacing: BAR_SPACING_PX,
+      rightOffset: 0,
+    },
+    localization: { timeFormatter },
+  });
+
+  soldLwVolume = soldLWChart.addHistogramSeries({
+    priceFormat: { type: "volume" },
+    priceScaleId: "",
+    lastValueVisible: false,
+    priceLineVisible: false,
+    scaleMargins: { top: 1 - VOLUME_HEIGHT, bottom: 0 },
+  });
+
+  soldLwCandle = soldLWChart.addCandlestickSeries({
+    upColor: "rgba(32,201,151,1)",
+    downColor: "rgba(255,77,109,1)",
+    borderUpColor: "rgba(32,201,151,1)",
+    borderDownColor: "rgba(255,77,109,1)",
+    wickUpColor: "rgba(32,201,151,1)",
+    wickDownColor: "rgba(255,77,109,1)",
+  });
+
+  soldLwSMA = soldLWChart.addLineSeries({ color: "red", lineWidth: 2 });
+  soldLwVWAP = soldLWChart.addLineSeries({ color: "yellow", lineWidth: 2 });
+
+  soldLwOnResize = () => {
+    if (!soldLWChart || !soldChartContainer) return;
+    soldLWChart.resize(soldChartContainer.clientWidth || width, soldChartContainer.clientHeight || height);
+    soldRedrawBoundaryLine();
+  };
+  window.addEventListener("resize", soldLwOnResize);
+
+  soldBoundaryHandler = () => soldRedrawBoundaryLine();
+  try {
+    const ts = soldLWChart.timeScale && soldLWChart.timeScale();
+    if (ts && ts.subscribeVisibleLogicalRangeChange) ts.subscribeVisibleLogicalRangeChange(soldBoundaryHandler);
+  } catch (_) {}
+
+  return true;
+}
+
+function soldPaintCurrentChart() {
+  if (!soldLWChart || !soldLwCandle || !soldLwVolume || !soldLwSMA || !soldLwVWAP) return;
+  if (!soldCurrentChartPayload || !soldCurrentChartBars || !soldCurrentChartFull) return;
+
+  const total = soldCurrentChartFull.candles.length;
+  const shownNRaw = Math.max(0, Math.min(soldCurrentChartShownN, total));
+  const isFull = shownNRaw >= total;
+  const shown = isFull
+    ? soldCurrentChartFull
+    : buildSeries(soldCurrentChartBars.slice(0, shownNRaw), soldCurrentChartOpenUnix);
+  const shownN = shown.candles.length;
+
+  soldLwCandle.setData(shown.candles);
+  soldLwVolume.setData(shown.volumes);
+  soldLwSMA.setData(shown.sma9);
+  soldLwVWAP.setData(shown.vwap);
+
+  const rightPad = isFull ? 2 : 14;
+  try {
+    soldLWChart.timeScale().setVisibleLogicalRange({
+      from: 0,
+      to: Math.max(0, (shownN - 1) + rightPad),
+    });
+  } catch (_) {
+    try { soldLWChart.timeScale().fitContent(); } catch (_) {}
+  }
+
+  if (soldCurrentChartSep && soldCurrentChartSep.t0 && soldCurrentChartSep.t1) {
+    soldSetBoundaryLineBetween(soldCurrentChartSep.t0, soldCurrentChartSep.t1);
+  } else {
+    soldClearBoundaryLine();
+  }
+
+  if (soldChartNextBarBtn) {
+    const hasNext = soldCurrentChartBars && soldCurrentChartShownN < soldCurrentChartBars.length;
+    soldChartNextBarBtn.disabled = !hasNext;
+  }
+  if (soldChartRevealBtn) {
+    const hasRest = soldCurrentChartBars && soldCurrentChartShownN < soldCurrentChartBars.length;
+    soldChartRevealBtn.disabled = !hasRest;
+    soldChartRevealBtn.textContent = hasRest ? "Show Rest" : "Rest Shown";
+  }
+
+  const prev = soldCurrentChartPayload.prev_close_date_ny
+    ? `PrevClose: ${soldCurrentChartPayload.prev_close_date_ny}`
+    : "PrevClose: —";
+  const exitUnix = soldCurrentChartPayload.exit_unix || 0;
+  const exitHM = exitUnix ? new Intl.DateTimeFormat("en-US", {
+    timeZone: chartsTimeZone || "America/New_York", hour12:false, hour:"2-digit", minute:"2-digit"
+  }).format(new Date(exitUnix * 1000)) : "—";
+  if (soldChartMeta) {
+    const hint = (soldCurrentChartBars && soldCurrentChartShownN < soldCurrentChartBars.length)
+      ? `Click “Show next” (1 bar) or “Show Rest” (to ${exitHM})`
+      : `All bars shown → ${exitHM}`;
+    soldChartMeta.textContent =
+      `${soldCurrentChartPayload.date_ny} · ${prev} · Showing ${shownN}/${total} · ${hint}`;
+  }
+}
+
+async function showSoldChartAt(idx) {
+  const list = soldOffTickers;
+  if (!list.length) return;
+  if (!chartsDateISO) return;
+
+  soldChartsOpen = true;
+  if (idx < 0) idx = 0;
+  if (idx >= list.length) idx = list.length - 1;
+  soldChartIndex = idx;
+
+  const sym = list[soldChartIndex];
+  soldCurrentChartKey = `${chartsDateISO}:${sym}`;
+
+  if (soldChartTickerSelect) soldChartTickerSelect.value = sym;
+  if (soldChartCounter) soldChartCounter.textContent = `${soldChartIndex + 1} / ${list.length}`;
+  if (soldChartPrevBtn) soldChartPrevBtn.disabled = (soldChartIndex <= 0);
+  if (soldChartNextBtn) soldChartNextBtn.disabled = (soldChartIndex >= list.length - 1);
+
+  if (soldChartPanel) soldChartPanel.style.display = "";
+  if (soldChartSym) soldChartSym.textContent = sym;
+  if (soldChartMeta) soldChartMeta.textContent = "Loading…";
+
+  soldCurrentChartSep = null;
+  soldClearBoundaryLine();
+
+  try {
+    const payload = await fetchChartBars(sym);
+    chartsTimeZone = payload.timezone || chartsTimeZone || "America/New_York";
+
+    const openUnix = payload.open_unix || 0;
+    const bars = Array.isArray(payload.bars) ? payload.bars : [];
+    if (!bars.length) {
+      if (soldChartMeta) soldChartMeta.textContent = "No bars returned for this symbol/time window.";
+      soldDestroyLWChart();
+      return;
+    }
+    if (!soldEnsureLWChart()) return;
+
+    soldCurrentChartPayload = payload;
+    soldCurrentChartBars = bars;
+    soldCurrentChartOpenUnix = openUnix;
+    soldCurrentChartFull = buildSeries(bars, openUnix);
+
+    // Initial window: prev-close (optional) + 09:30..09:35 inclusive
+    const lastInitialUnix = openUnix ? (openUnix + (INITIAL_MINUTES_AFTER_OPEN - 1) * 60) : 0;
+    let initN = 0;
+    if (openUnix) {
+      for (const b of bars) {
+        if (b.time < openUnix) { initN++; continue; }
+        if (b.time <= lastInitialUnix) { initN++; continue; }
+        break;
+      }
+    } else {
+      initN = Math.min(bars.length, 1 + INITIAL_MINUTES_AFTER_OPEN);
+    }
+    soldCurrentChartShownN = initN;
+
+    soldPaintCurrentChart();
+  } catch (err) {
+    if (soldChartMeta) soldChartMeta.textContent = `Chart load failed: ${err?.message || err}`;
+    soldDestroyLWChart();
+  }
+}
+
 function renderSoldOff(report, st) {
   if (!soldOffTitle || !soldOffHint || !soldOffBody) return;
 
@@ -883,6 +1271,49 @@ function renderSoldOff(report, st) {
 
   const rows = Array.isArray(report?.sold_off) ? report.sold_off : [];
   soldOffTickers = rows.map(r => r.symbol).filter(Boolean);
+
+  // NEW: sold-off chart toolbar state
+  const active = soldOffTickers;
+  if (active.length) {
+    soldSetChartsToolbarVisible(true);
+    if (showSoldChartsBtn) showSoldChartsBtn.disabled = false;
+
+    // Preserve chartIndex by symbol when possible
+    if (soldChartsOpen && soldCurrentChartPayload?.symbol) {
+      const idx = active.indexOf(soldCurrentChartPayload.symbol);
+      if (idx >= 0) soldChartIndex = idx;
+    }
+    if (soldChartIndex >= active.length) soldChartIndex = 0;
+
+    // Rebuild dropdown, preserve selection
+    if (soldChartTickerSelect) {
+      const prevVal = soldChartTickerSelect.value;
+      soldChartTickerSelect.innerHTML = active.map(s => `<option value="${s}">${s}</option>`).join("");
+      const keep = active.includes(prevVal) ? prevVal : (active[soldChartIndex] || active[0] || "");
+      if (keep) soldChartTickerSelect.value = keep;
+    }
+
+    if (soldChartCounter) {
+      soldChartCounter.textContent = soldChartsOpen
+        ? `${Math.min(soldChartIndex + 1, active.length)} / ${active.length}`
+        : `— / ${active.length}`;
+    }
+    if (soldChartPrevBtn) soldChartPrevBtn.disabled = soldChartsOpen ? (soldChartIndex <= 0) : true;
+    if (soldChartNextBtn) soldChartNextBtn.disabled = soldChartsOpen ? (soldChartIndex >= active.length - 1) : (active.length <= 1);
+
+    // If open, only load if needed (don’t reset “Show next” progress every poll)
+    if (soldChartsOpen) {
+      const sym = active[soldChartIndex] || "";
+      const desiredKey = sym ? `${chartsDateISO}:${sym}` : "";
+      const needsLoad = !desiredKey || !soldLWChart || !soldCurrentChartBars || (soldCurrentChartKey !== desiredKey);
+      if (needsLoad) showSoldChartAt(soldChartIndex).catch(() => {});
+    } else {
+      soldHideChartsUI(true);
+    }
+  } else {
+    soldSetChartsToolbarVisible(false);
+    soldHideChartsUI(true);
+  }
 
   soldOffBody.innerHTML = "";
   for (const s of rows) {
@@ -937,6 +1368,9 @@ function renderHistoric(report, mode, st) {
   const resolvedISO = st.historic_resolved_date_ny || report?.summary?.date_ny || "";
   const targetISO = st.historic_target_date_ny || "";
   const displayISO = clampISO(resolvedISO || targetISO || (st.now_ny || "").slice(0, 10));
+
+  // NEW: keep the chart date in sync even when Performance is ON
+  if (displayISO) chartsDateISO = displayISO;
   if (historicDateInput && document.activeElement !== historicDateInput) {
     if (historicDateInput.value !== displayISO) historicDateInput.value = displayISO;
   }
@@ -1420,6 +1854,65 @@ if (chartRevealBtn) {
 
     currentChartShownN = currentChartBars.length;
     paintCurrentChart();
+  });
+}
+
+// Sold-off charts UI wiring
+if (showSoldChartsBtn) {
+  showSoldChartsBtn.addEventListener("click", () => {
+    if (!soldOffTickers.length) return;
+    soldChartsOpen = true;
+    soldChartIndex = 0;
+    showSoldChartAt(0).catch(() => {});
+  });
+}
+if (hideSoldChartsBtn) {
+  hideSoldChartsBtn.addEventListener("click", () => {
+    soldChartsOpen = false;
+    soldHideChartsUI(true);
+  });
+}
+if (soldChartPrevBtn) {
+  soldChartPrevBtn.addEventListener("click", () => {
+    showSoldChartAt(soldChartIndex - 1).catch(() => {});
+  });
+}
+if (soldChartNextBtn) {
+  soldChartNextBtn.addEventListener("click", () => {
+    showSoldChartAt(soldChartIndex + 1).catch(() => {});
+  });
+}
+if (soldChartTickerSelect) {
+  soldChartTickerSelect.addEventListener("change", () => {
+    const sym = soldChartTickerSelect.value;
+    const idx = soldOffTickers.indexOf(sym);
+    if (idx >= 0) showSoldChartAt(idx).catch(() => {});
+  });
+}
+if (soldChartNextBarBtn) {
+  soldChartNextBarBtn.addEventListener("click", () => {
+    if (!soldCurrentChartPayload || !soldCurrentChartBars || !soldCurrentChartFull) return;
+    if (soldCurrentChartShownN >= soldCurrentChartBars.length) return;
+    soldCurrentChartShownN++;
+    soldPaintCurrentChart();
+  });
+}
+if (soldChartRevealBtn) {
+  soldChartRevealBtn.addEventListener("click", () => {
+    if (!soldCurrentChartPayload || !soldCurrentChartBars || !soldCurrentChartFull) return;
+    if (soldCurrentChartShownN >= soldCurrentChartBars.length) return;
+
+    // Separator EXACTLY between last shown and first newly revealed
+    soldCurrentChartSep = null;
+    const n = soldCurrentChartShownN;
+    if (n > 0 && soldCurrentChartBars.length > n) {
+      const t0 = soldCurrentChartBars[n - 1]?.time;
+      const t1 = soldCurrentChartBars[n]?.time;
+      if (t0 && t1 && t1 > t0) soldCurrentChartSep = { t0, t1 };
+    }
+
+    soldCurrentChartShownN = soldCurrentChartBars.length;
+    soldPaintCurrentChart();
   });
 }
 
