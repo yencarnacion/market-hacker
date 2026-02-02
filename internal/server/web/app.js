@@ -14,6 +14,7 @@ const hideChartsBtn = $("hideChartsBtn");
 const chartPrevBtn = $("chartPrevBtn");
 const chartNextBtn = $("chartNextBtn");
 const chartTickerSelect = $("chartTickerSelect");
+const chartListSelect = $("chartListSelect");
 const chartCounter = $("chartCounter");
 const chartPanel = $("chartPanel");
 const chartContainer = $("chartContainer");
@@ -21,6 +22,11 @@ const chartSym = $("chartSym");
 const chartMeta = $("chartMeta");
 const chartRevealBtn = $("chartRevealBtn");
 const chartNextBarBtn = $("chartNextBarBtn");
+
+// Sold-off section
+const soldOffTitle = $("soldOffTitle");
+const soldOffHint = $("soldOffHint");
+const soldOffBody = $("soldOffBody");
 
 const nfInt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 
@@ -37,6 +43,11 @@ const f_entry_min = $("f_entry_min");
 const f_entry_max = $("f_entry_max");
 const f_px_min = $("f_px_min");
 const f_px_max = $("f_px_max");
+
+// Sold-off scan filters
+const f_sold_pct_min = $("f_sold_pct_min");
+const f_sold_rng_min = $("f_sold_rng_min");
+const f_sold_today_min = $("f_sold_today_min");
 
 // Historic controls (exist in DOM even if the card is hidden)
 const historicDateInput = $("historicDate");
@@ -62,6 +73,18 @@ let chartsOpen = false;
 let chartIndex = 0;
 let interestTickers = [];
 const chartDataCache = new Map(); // sym -> payload from /api/chart/bars
+
+let soldOffTickers = [];
+
+let chartListMode = "interest"; // "interest" | "soldoff"
+try {
+  const saved = localStorage.getItem("orb_chart_list_mode");
+  if (saved === "interest" || saved === "soldoff") chartListMode = saved;
+} catch (_) {}
+
+function getActiveChartTickers() {
+  return (chartListMode === "soldoff") ? soldOffTickers : interestTickers;
+}
 
 // lightweight-charts instances
 let lwChart = null;
@@ -218,6 +241,10 @@ async function applyFilters() {
     entry_minutes_after_open_max: intVal(f_entry_max),
     entry_price_min: numVal(f_px_min),
     entry_price_max: numVal(f_px_max),
+
+    sold_off_from_open_pct_min: numVal(f_sold_pct_min),
+    sold_off_open5m_range_pct_min: numVal(f_sold_rng_min),
+    sold_off_open5m_today_pct_min: numVal(f_sold_today_min),
   };
 
   setFiltersStatus("Saving…");
@@ -378,6 +405,7 @@ function resetChartsState() {
   chartsOpen = false;
   chartIndex = 0;
   interestTickers = [];
+  soldOffTickers = [];
   chartDataCache.clear();
   currentChartKey = "";
   currentChartPayload = null;
@@ -757,23 +785,24 @@ function paintCurrentChart() {
 }
 
 async function showChartAt(idx) {
-  if (!interestTickers.length) return;
+  const list = getActiveChartTickers();
+  if (!list.length) return;
   if (!chartsDateISO) return;
 
   chartsOpen = true;
 
   // clamp index
   if (idx < 0) idx = 0;
-  if (idx >= interestTickers.length) idx = interestTickers.length - 1;
+  if (idx >= list.length) idx = list.length - 1;
   chartIndex = idx;
 
-  const sym = interestTickers[chartIndex];
+  const sym = list[chartIndex];
   currentChartKey = `${chartsDateISO}:${sym}`;
 
   if (chartTickerSelect) chartTickerSelect.value = sym;
-  if (chartCounter) chartCounter.textContent = `${chartIndex + 1} / ${interestTickers.length}`;
+  if (chartCounter) chartCounter.textContent = `${chartIndex + 1} / ${list.length}`;
   if (chartPrevBtn) chartPrevBtn.disabled = (chartIndex <= 0);
-  if (chartNextBtn) chartNextBtn.disabled = (chartIndex >= interestTickers.length - 1);
+  if (chartNextBtn) chartNextBtn.disabled = (chartIndex >= list.length - 1);
 
   if (chartPanel) chartPanel.style.display = "";
   if (chartSym) chartSym.textContent = sym;
@@ -831,6 +860,48 @@ async function showChartAt(idx) {
   }
 }
 
+function renderSoldOff(report, st) {
+  if (!soldOffTitle || !soldOffHint || !soldOffBody) return;
+
+  soldOffTitle.textContent = "Sold off by 10:30";
+
+  const f = st?.filters || {};
+  const downMin = (typeof f.sold_off_from_open_pct_min === "number") ? f.sold_off_from_open_pct_min : null;
+  const rngMin  = (typeof f.sold_off_open5m_range_pct_min === "number") ? f.sold_off_open5m_range_pct_min : null;
+  const todayMin = (typeof f.sold_off_open5m_today_pct_min === "number") ? f.sold_off_open5m_today_pct_min : null;
+
+  let hint = "Historic scan for tickers that sold off hard from the 09:30 open by 10:30.";
+  if (downMin !== null && rngMin !== null && todayMin !== null) {
+    hint = `Down ≥ ${fmtPct(downMin)} from the 09:30 open by 10:30, with Open5m Range% ≥ ${fmtPct(rngMin)} and Open5m Today% ≥ ${todayMin}%.`;
+  }
+
+  const end = report?.summary?.window_end_ny || "";
+  if (end && end < "10:30:00") {
+    hint += ` (Data ends at ${end}, so this scan may be incomplete.)`;
+  }
+  soldOffHint.textContent = hint;
+
+  const rows = Array.isArray(report?.sold_off) ? report.sold_off : [];
+  soldOffTickers = rows.map(r => r.symbol).filter(Boolean);
+
+  soldOffBody.innerHTML = "";
+  for (const s of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><strong>${s.symbol}</strong></td>
+      <td>${fmtPct(s.drop_pct)}</td>
+      <td>${fmt(s.open_0930, 4)}</td>
+      <td>${fmt(s.low_price, 4)}</td>
+      <td>${s.low_time_ny || "—"}</td>
+      <td>${fmt(s.price_at_scan_time, 4)}</td>
+      <td>${fmtPct(s.open_5m_range_pct)}</td>
+      <td>${fmtInt(s.open_5m_vol)}</td>
+      <td>${isFinite(s.open_5m_today_pct) ? s.open_5m_today_pct.toFixed(1) + "%" : "—"}</td>
+    `;
+    soldOffBody.appendChild(tr);
+  }
+}
+
 function renderHistoric(report, mode, st) {
   const card = $("historicCard");
   if (mode !== "historic") {
@@ -857,7 +928,10 @@ function renderHistoric(report, mode, st) {
   histMaxISO = st.historic_max_date_ny || "";
   if (historicDateInput) {
     if (histMinISO) historicDateInput.min = histMinISO;
+    else historicDateInput.removeAttribute("min");
+
     if (histMaxISO) historicDateInput.max = histMaxISO;
+    else historicDateInput.removeAttribute("max");
   }
 
   const resolvedISO = st.historic_resolved_date_ny || report?.summary?.date_ny || "";
@@ -895,7 +969,10 @@ function renderHistoric(report, mode, st) {
     if (noEntryHint) noEntryHint.textContent = "All tickers that met the 09:30–09:35 selection filters (Open5m Range% + Open5m Vol).";
 
     const nb = $("noEntryBody");
-    if (!nb) return;
+    if (!nb) {
+      renderSoldOff(report, st);
+      return;
+    }
     nb.innerHTML = "";
 
     // Build reason maps from the report if available
@@ -917,35 +994,54 @@ function renderHistoric(report, mode, st) {
       (st.historic_resolved_date_ny || st.historic_target_date_ny || (st.now_ny || "").slice(0,10) || "");
     interestTickers = syms;
 
-    if (interestTickers.length) {
+    // Sold-off list comes from the report (if ready)
+    const sold = Array.isArray(report?.sold_off) ? report.sold_off : [];
+    soldOffTickers = sold.map(x => x.symbol).filter(Boolean);
+
+    // Build the chart list selector
+    if (chartListSelect) {
+      // If the current mode has no items but the other does, auto-switch.
+      if (chartListMode === "interest" && !interestTickers.length && soldOffTickers.length) chartListMode = "soldoff";
+      if (chartListMode === "soldoff" && !soldOffTickers.length && interestTickers.length) chartListMode = "interest";
+
+      chartListSelect.innerHTML = `
+        <option value="interest">Of interest (${interestTickers.length})</option>
+        <option value="soldoff">Sold off (${soldOffTickers.length})</option>
+      `;
+      chartListSelect.value = chartListMode;
+    }
+
+    const active = getActiveChartTickers();
+
+    if (active.length) {
       setChartsToolbarVisible(true);
       if (showChartsBtn) showChartsBtn.disabled = false;
 
       // Keep chartIndex stable by symbol when possible (prevents jumping if list changes)
       if (chartsOpen && currentChartPayload?.symbol) {
-        const idx = interestTickers.indexOf(currentChartPayload.symbol);
+        const idx = active.indexOf(currentChartPayload.symbol);
         if (idx >= 0) chartIndex = idx;
       }
-      if (chartIndex >= interestTickers.length) chartIndex = 0;
+      if (chartIndex >= active.length) chartIndex = 0;
 
-      const selectedSym = interestTickers[chartIndex] || "";
+      const selectedSym = active[chartIndex] || "";
 
       // Rebuild dropdown, preserve selection
       if (chartTickerSelect) {
         const prevVal = chartTickerSelect.value;
-        chartTickerSelect.innerHTML = interestTickers.map(s => `<option value="${s}">${s}</option>`).join("");
-        const nextVal = chartsOpen ? selectedSym : (interestTickers.includes(prevVal) ? prevVal : selectedSym);
+        chartTickerSelect.innerHTML = active.map(s => `<option value="${s}">${s}</option>`).join("");
+        const nextVal = chartsOpen ? selectedSym : (active.includes(prevVal) ? prevVal : selectedSym);
         if (nextVal) chartTickerSelect.value = nextVal;
       }
 
       // Toolbar state: don't stomp it to "—" while chart is open
       if (chartCounter) {
         chartCounter.textContent = chartsOpen
-          ? `${Math.min(chartIndex + 1, interestTickers.length)} / ${interestTickers.length}`
-          : `— / ${interestTickers.length}`;
+          ? `${Math.min(chartIndex + 1, active.length)} / ${active.length}`
+          : `— / ${active.length}`;
       }
       if (chartPrevBtn) chartPrevBtn.disabled = chartsOpen ? (chartIndex <= 0) : true;
-      if (chartNextBtn) chartNextBtn.disabled = chartsOpen ? (chartIndex >= interestTickers.length - 1) : (interestTickers.length <= 1);
+      if (chartNextBtn) chartNextBtn.disabled = chartsOpen ? (chartIndex >= active.length - 1) : (active.length <= 1);
 
       // CRITICAL FIX:
       // Do NOT call showChartAt() every 1s poll. That resets currentChartShownN and makes bars "disappear".
@@ -982,6 +1078,9 @@ function renderHistoric(report, mode, st) {
       `;
       nb.appendChild(row);
     }
+
+    // Always render sold-off section (doesn't interfere with existing tables)
+    renderSoldOff(report, st);
     return;
   }
 
@@ -991,7 +1090,10 @@ function renderHistoric(report, mode, st) {
   if (noEntryTitle) noEntryTitle.textContent = "Selected but no entry";
   if (noEntryHint) noEntryHint.textContent = "Useful for diagnosing false positives (no VWAP cross in the entry window, Today% filter failures, etc.).";
 
-  if (!report || !report.summary) return;
+  if (!report || !report.summary) {
+    renderSoldOff(report, st);
+    return;
+  }
 
   const s = report.summary;
   const metrics = [
@@ -1069,6 +1171,9 @@ function renderHistoric(report, mode, st) {
     `;
     nb.appendChild(tr);
   }
+
+  // Always render sold-off section (doesn't interfere with existing tables)
+  renderSoldOff(report, st);
 }
 
 function renderState(st) {
@@ -1105,6 +1210,10 @@ function renderState(st) {
   syncInput(f_entry_max, f.entry_minutes_after_open_max);
   syncInput(f_px_min, f.entry_price_min);
   syncInput(f_px_max, f.entry_price_max);
+
+  syncInput(f_sold_pct_min, f.sold_off_from_open_pct_min);
+  syncInput(f_sold_rng_min, f.sold_off_open5m_range_pct_min);
+  syncInput(f_sold_today_min, f.sold_off_open5m_today_pct_min);
 
   // New session boundary: clear UI caches so identical event IDs across replays don't get ignored
   if (st.session_id && st.session_id !== currentSessionID) {
@@ -1193,6 +1302,7 @@ for (const el of [
   f_today_min, f_today_max,
   f_entry_min, f_entry_max,
   f_px_min, f_px_max,
+  f_sold_pct_min, f_sold_rng_min, f_sold_today_min,
 ]) {
   if (!el) continue;
   el.addEventListener("input", () => markFilterDirty(el));
@@ -1244,7 +1354,7 @@ if (histNextBtn) {
 // Charts UI wiring
 if (showChartsBtn) {
   showChartsBtn.addEventListener("click", () => {
-    if (!interestTickers.length) return;
+    if (!getActiveChartTickers().length) return;
     chartsOpen = true;
     chartIndex = 0; // start with the first chart in the Of-interest list
     showChartAt(chartIndex).catch(() => {});
@@ -1269,8 +1379,18 @@ if (chartNextBtn) {
 if (chartTickerSelect) {
   chartTickerSelect.addEventListener("change", () => {
     const sym = chartTickerSelect.value;
-    const idx = interestTickers.indexOf(sym);
+    const idx = getActiveChartTickers().indexOf(sym);
     if (idx >= 0) showChartAt(idx).catch(() => {});
+  });
+}
+
+if (chartListSelect) {
+  chartListSelect.addEventListener("change", () => {
+    const v = chartListSelect.value;
+    chartListMode = (v === "soldoff") ? "soldoff" : "interest";
+    try { localStorage.setItem("orb_chart_list_mode", chartListMode); } catch (_) {}
+    chartIndex = 0;
+    if (chartsOpen) showChartAt(0).catch(() => {});
   });
 }
 

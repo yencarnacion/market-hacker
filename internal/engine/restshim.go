@@ -107,3 +107,44 @@ func (r *mrestClientShim) ListTrades(ctx context.Context, ticker string, startNY
 	it := r.c.ListTrades(ctx, params)
 	return TradeIter{it: it}
 }
+
+// MinLowAndLastClose returns:
+// - min low price across 1-minute bars in [start,end)
+// - time (NY) of that min low (approx, based on bar index)
+// - last close seen in the range (approx px at end)
+func (r *mrestClientShim) MinLowAndLastClose(ctx context.Context, ticker string, startNY, endNY time.Time) (minLow float64, minLowTime time.Time, lastClose float64, ok bool, err error) {
+	params := models.ListAggsParams{
+		Ticker:     ticker,
+		Multiplier: 1,
+		Timespan:   models.Minute,
+		From:       massive.ToMillis(startNY),
+		To:         massive.ToMillis(endNY),
+	}
+	it := r.c.ListAggs(ctx, &params)
+
+	idx := 0
+	n := 0
+	for it.Next() {
+		a := it.Item()
+		barStart := startNY.Add(time.Duration(idx) * time.Minute)
+		idx++
+		n++
+
+		if a.Low > 0 {
+			if minLow == 0 || a.Low < minLow {
+				minLow = a.Low
+				minLowTime = barStart
+			}
+		}
+		if a.Close > 0 {
+			lastClose = a.Close
+		}
+	}
+	if err := it.Err(); err != nil {
+		return 0, time.Time{}, 0, false, err
+	}
+	if n == 0 || minLow <= 0 || lastClose <= 0 {
+		return 0, time.Time{}, 0, false, nil
+	}
+	return minLow, minLowTime, lastClose, true, nil
+}

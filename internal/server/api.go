@@ -85,6 +85,10 @@ type filtersPatch struct {
 	EntryMaxAfterOpen *int     `json:"entry_minutes_after_open_max"`
 	EntryPriceMin     *float64 `json:"entry_price_min"`
 	EntryPriceMax     *float64 `json:"entry_price_max"`
+
+	SoldOffFromOpenPctMin    *float64 `json:"sold_off_from_open_pct_min"`
+	SoldOffOpen5mRangePctMin *float64 `json:"sold_off_open5m_range_pct_min"`
+	SoldOffOpen5mTodayPctMin *float64 `json:"sold_off_open5m_today_pct_min"`
 }
 
 func (s *Server) handleFilters(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +138,16 @@ func (s *Server) handleFilters(w http.ResponseWriter, r *http.Request) {
 			}
 			if p.EntryPriceMax != nil {
 				f.EntryPriceMax = *p.EntryPriceMax
+			}
+
+			if p.SoldOffFromOpenPctMin != nil {
+				f.SoldOffFromOpenPctMin = *p.SoldOffFromOpenPctMin
+			}
+			if p.SoldOffOpen5mRangePctMin != nil {
+				f.SoldOffOpen5mRangePctMin = *p.SoldOffOpen5mRangePctMin
+			}
+			if p.SoldOffOpen5mTodayPctMin != nil {
+				f.SoldOffOpen5mTodayPctMin = *p.SoldOffOpen5mTodayPctMin
 			}
 			return nil
 		})

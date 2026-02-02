@@ -16,6 +16,243 @@ import (
 
 const historicShares = 1000
 
+const soldOffScanHMS = "10:30:00" // fixed per your request (“by 10:30am”)
+
+type open5mMetric struct {
+	Open0930  float64
+	ORHigh    float64
+	ORLow     float64
+	Open5mVol float64
+	RangePct  float64
+}
+
+func (e *Engine) snapshotOpen5mMetricsForWatchlist() map[string]open5mMetric {
+	wl := e.st.Watchlist()
+	out := make(map[string]open5mMetric, len(wl))
+	for _, sym := range wl {
+		t := e.st.GetTicker(sym)
+		if t == nil {
+			continue
+		}
+		if t.Open0930 <= 0 || t.ORHigh <= 0 || t.ORLow <= 0 || t.Open5mVol <= 0 {
+			continue
+		}
+		rng := (t.ORHigh - t.ORLow) / t.Open0930
+		out[sym] = open5mMetric{
+			Open0930:  t.Open0930,
+			ORHigh:    t.ORHigh,
+			ORLow:     t.ORLow,
+			Open5mVol: t.Open5mVol,
+			RangePct:  rng,
+		}
+	}
+	return out
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() {
+		return a
+	}
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+func (e *Engine) scanSoldOff(ctx context.Context, rest *mrestClientShim, openNY, scanEndNY time.Time, openMetrics map[string]open5mMetric) ([]store.HistoricSoldOff, error) {
+	f := e.st.Filters()
+
+	if scanEndNY.Before(openNY.Add(1 * time.Minute)) {
+		return nil, nil
+	}
+
+	// Stage 0: eligible by open-5m range (cheap)
+	syms := make([]string, 0, len(openMetrics))
+	for sym, m := range openMetrics {
+		if m.Open0930 <= 0 || m.Open5mVol <= 0 {
+			continue
+		}
+		if m.RangePct < f.SoldOffOpen5mRangePctMin {
+			continue
+		}
+		syms = append(syms, sym)
+	}
+	sort.Strings(syms)
+	if len(syms) == 0 {
+		return nil, nil
+	}
+
+	e.emit(time.Now().In(e.loc), "SYSTEM", "", fmt.Sprintf("Sold-off scan: checking %d tickers (09:30 → %s)…", len(syms), scanEndNY.In(e.loc).Format("15:04:05")), "", "info")
+
+	// Stage 1: fetch min low + last close in [open, scanEnd)
+	type s1 struct {
+		sym     string
+		low     float64
+		lowTime time.Time
+		last    float64
+		ok      bool
+		err     error
+	}
+
+	jobs := make(chan string)
+	results := make(chan s1)
+
+	workerN := e.cfg.History.MaxWorkers
+	if workerN < 1 {
+		workerN = 1
+	}
+	if workerN > len(syms) {
+		workerN = len(syms)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerN; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sym := range jobs {
+				low, lowTime, last, ok, err := rest.MinLowAndLastClose(ctx, sym, openNY, scanEndNY)
+				results <- s1{sym: sym, low: low, lowTime: lowTime, last: last, ok: ok, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, sym := range syms {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- sym:
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	type pre struct {
+		sym     string
+		m       open5mMetric
+		low     float64
+		lowTime time.Time
+		last    float64
+		drop    float64
+	}
+
+	preBySym := make(map[string]pre, 64)
+	for r := range results {
+		if r.err != nil || !r.ok {
+			continue
+		}
+		m := openMetrics[r.sym]
+		if m.Open0930 <= 0 || r.low <= 0 {
+			continue
+		}
+		drop := (m.Open0930 - r.low) / m.Open0930
+		if drop < f.SoldOffFromOpenPctMin {
+			continue
+		}
+		preBySym[r.sym] = pre{sym: r.sym, m: m, low: r.low, lowTime: r.lowTime, last: r.last, drop: drop}
+	}
+
+	if len(preBySym) == 0 {
+		e.emit(time.Now().In(e.loc), "SYSTEM", "", "Sold-off scan: 0 tickers matched the drop + Open5m Range% filters.", "", "info")
+		return nil, nil
+	}
+
+	// Stage 2: compute Open5mToday% for the pre-filtered set only (expensive)
+	preSyms := make([]string, 0, len(preBySym))
+	for sym := range preBySym {
+		preSyms = append(preSyms, sym)
+	}
+	sort.Strings(preSyms)
+
+	type s2 struct {
+		sym string
+		pct float64
+		err error
+	}
+	jobs2 := make(chan string)
+	results2 := make(chan s2)
+
+	workerN2 := e.cfg.History.MaxWorkers
+	if workerN2 < 1 {
+		workerN2 = 1
+	}
+	if workerN2 > len(preSyms) {
+		workerN2 = len(preSyms)
+	}
+
+	var wg2 sync.WaitGroup
+	for i := 0; i < workerN2; i++ {
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			for sym := range jobs2 {
+				p := preBySym[sym]
+				avg, err := e.avgPrevSessionsOpen5mVol(ctx, rest, sym, openNY, e.cfg.History.Open5mLookbackSessions, e.cfg.History.MaxCalendarLookback)
+				if err != nil || avg <= 0 {
+					results2 <- s2{sym: sym, err: err}
+					continue
+				}
+				pct := (p.m.Open5mVol / avg) * 100.0
+				results2 <- s2{sym: sym, pct: pct, err: nil}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs2)
+		for _, sym := range preSyms {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs2 <- sym:
+			}
+		}
+	}()
+	go func() {
+		wg2.Wait()
+		close(results2)
+	}()
+
+	out := make([]store.HistoricSoldOff, 0, len(preSyms))
+	for r := range results2 {
+		if r.err != nil {
+			continue
+		}
+		if r.pct < f.SoldOffOpen5mTodayPctMin {
+			continue
+		}
+		p := preBySym[r.sym]
+		out = append(out, store.HistoricSoldOff{
+			Symbol:          p.sym,
+			Open0930:        p.m.Open0930,
+			LowPrice:        p.low,
+			LowTimeNY:       p.lowTime.In(e.loc).Format("15:04:05"),
+			PriceAtScanTime: p.last,
+			DropPct:         p.drop,
+			Open5mVol:       p.m.Open5mVol,
+			Open5mRangePct:  p.m.RangePct,
+			Open5mTodayPct:  r.pct,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DropPct == out[j].DropPct {
+			return out[i].Symbol < out[j].Symbol
+		}
+		return out[i].DropPct > out[j].DropPct
+	})
+
+	e.emit(time.Now().In(e.loc), "SYSTEM", "", fmt.Sprintf("Sold-off scan: %d tickers matched.", len(out)), "", "info")
+	return out, nil
+}
+
 // correctCandidatesOpen5mViaREST re-fetches the official 09:30–09:35 bars for the selected tickers only,
 // then re-applies the current open5m filters. This is used in "start after 09:30" scenarios to avoid
 // REST-calling the full watchlist but still make final candidates accurate.
@@ -191,12 +428,20 @@ func (e *Engine) runHistoricLiveToday(ctx context.Context, rest *mrestClientShim
 	}
 
 	// Candidate selection
+	openMetricsAll := e.snapshotOpen5mMetricsForWatchlist()
 	e.st.SetPhase(store.PhaseSelecting0935)
 	candidates := e.selectCandidatesAt0935()
 	if len(candidates) == 0 {
-		e.emit(time.Now().In(e.loc), "SYSTEM", "", "No tickers matched open_5m filters at 09:35.", "", "info")
+		endNY := time.Now().In(e.loc)
+		e.emit(endNY, "SYSTEM", "", "No tickers matched open_5m filters at 09:35.", "", "info")
 		e.st.SetPhase(store.PhaseClosed)
-		rep := e.buildHistoricReport(sessionDayNY, openNY, selNY, cutoffNY, exitNY, time.Now().In(e.loc))
+
+		scanNY := atTime(sessionDayNY, soldOffScanHMS, e.loc)
+		scanEnd := minTime(scanNY, endNY)
+		soldOff, _ := e.scanSoldOff(ctx, rest, openNY, scanEnd, openMetricsAll)
+
+		rep := e.buildHistoricReport(sessionDayNY, openNY, selNY, cutoffNY, exitNY, endNY)
+		rep.SoldOff = soldOff
 		e.st.SetHistoricReport(&rep)
 		return nil
 	}
@@ -204,13 +449,21 @@ func (e *Engine) runHistoricLiveToday(ctx context.Context, rest *mrestClientShim
 	// If we started after 09:30 and Open0930 may be estimated, correct candidates only (cheap).
 	corrected, _ := e.correctCandidatesOpen5mViaREST(ctx, rest, openNY, selNY, candidates)
 	if len(corrected) == 0 {
-		e.emit(time.Now().In(e.loc), "SYSTEM", "", "After REST correction, no tickers matched open_5m filters.", "", "info")
+		endNY := time.Now().In(e.loc)
+		e.emit(endNY, "SYSTEM", "", "After REST correction, no tickers matched open_5m filters.", "", "info")
 		e.st.SetPhase(store.PhaseClosed)
-		rep := e.buildHistoricReport(sessionDayNY, openNY, selNY, cutoffNY, exitNY, time.Now().In(e.loc))
+
+		scanNY := atTime(sessionDayNY, soldOffScanHMS, e.loc)
+		scanEnd := minTime(scanNY, endNY)
+		soldOff, _ := e.scanSoldOff(ctx, rest, openNY, scanEnd, openMetricsAll)
+
+		rep := e.buildHistoricReport(sessionDayNY, openNY, selNY, cutoffNY, exitNY, endNY)
+		rep.SoldOff = soldOff
 		e.st.SetHistoricReport(&rep)
 		return nil
 	}
 	candidates = corrected
+	openMetricsAll = e.snapshotOpen5mMetricsForWatchlist()
 
 	e.emit(time.Now().In(e.loc), "SYSTEM", "", fmt.Sprintf("09:35 selection: %d tickers matched (live tracking to 11:00).", len(candidates)), "", "info")
 
@@ -288,7 +541,13 @@ func (e *Engine) runHistoricLiveToday(ctx context.Context, rest *mrestClientShim
 			return nil
 		case <-closed11am:
 			e.st.SetPhase(store.PhaseClosed)
+
+			scanNY := atTime(sessionDayNY, soldOffScanHMS, e.loc)
+			scanEnd := minTime(scanNY, exitNY)
+			soldOff, _ := e.scanSoldOff(ctx, rest, openNY, scanEnd, openMetricsAll)
+
 			rep := e.buildHistoricReport(sessionDayNY, openNY, selNY, cutoffNY, exitNY, exitNY)
+			rep.SoldOff = soldOff
 			e.st.SetHistoricReport(&rep)
 			e.emit(time.Now().In(e.loc), "SYSTEM", "", "Historic report ready (see the web UI).", "", "info")
 			return nil
@@ -378,6 +637,8 @@ func (e *Engine) RunHistoricForDate(ctx context.Context, targetDateNY time.Time)
 		return err
 	}
 
+	openMetricsAll := e.snapshotOpen5mMetricsForWatchlist()
+
 	e.st.SetPhase(store.PhaseSelecting0935)
 	candidates := e.selectCandidatesAt0935()
 	if len(candidates) == 0 {
@@ -385,6 +646,10 @@ func (e *Engine) RunHistoricForDate(ctx context.Context, targetDateNY time.Time)
 		e.st.SetPhase(store.PhaseClosed)
 
 		rep := e.buildHistoricReport(resolvedDayNY, openNY, selNY, cutoffNY, exitNY, endNY)
+		scanNY := atTime(resolvedDayNY, soldOffScanHMS, e.loc)
+		scanEnd := minTime(scanNY, endNY)
+		soldOff, _ := e.scanSoldOff(ctx, rest, openNY, scanEnd, openMetricsAll)
+		rep.SoldOff = soldOff
 		e.st.SetHistoricReport(&rep)
 		return nil
 	}
@@ -448,6 +713,10 @@ func (e *Engine) RunHistoricForDate(ctx context.Context, targetDateNY time.Time)
 	e.st.SetPhase(store.PhaseClosed)
 
 	rep := e.buildHistoricReport(resolvedDayNY, openNY, selNY, cutoffNY, exitNY, endNY)
+	scanNY := atTime(resolvedDayNY, soldOffScanHMS, e.loc)
+	scanEnd := minTime(scanNY, endNY)
+	soldOff, _ := e.scanSoldOff(ctx, rest, openNY, scanEnd, openMetricsAll)
+	rep.SoldOff = soldOff
 	e.st.SetHistoricReport(&rep)
 
 	e.emit(time.Now().In(e.loc), "SYSTEM", "", "Historic report ready (see the web UI).", "", "info")

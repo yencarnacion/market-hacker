@@ -11,12 +11,20 @@ market:
 
 filters:
   open_5m_range_pct_min: 0.07
-  open_5m_range_pct_max: 0.11
+  open_5m_range_pct_max: 0.20
   open_5m_vol_min: 100000
   open_5m_vol_max: 500000
 
   open_5m_today_pct_min: 500
   open_5m_today_pct_max: 1500
+
+  # Historic "Sold off by 10:30" scan
+  # 0.20 = 20% down from the 09:30 open
+  sold_off_from_open_pct_min: 0.09
+  # 0.01 = 1% opening 5m range
+  sold_off_open5m_range_pct_min: 0.01
+  # 50 = 50% of avg prior open5m volume
+  sold_off_open5m_today_pct_min: 50
 
   entry_minutes_after_open_min: 5
   entry_minutes_after_open_max: 12
@@ -30,7 +38,7 @@ risk:
 
 history:
   open5m_lookback_sessions: 10
-  max_calendar_lookback_days: 35
+  max_calendar_lookback_days: 20
   max_workers: 6
 
 massive:

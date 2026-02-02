@@ -34,6 +34,11 @@ type Config struct {
 		EntryMaxAfterOpen int     `yaml:"entry_minutes_after_open_max"`
 		EntryPriceMin     float64 `yaml:"entry_price_min"`
 		EntryPriceMax     float64 `yaml:"entry_price_max"`
+
+		// Historic “sold off” scan (by 10:30)
+		SoldOffFromOpenPctMin    float64 `yaml:"sold_off_from_open_pct_min"`
+		SoldOffOpen5mRangePctMin float64 `yaml:"sold_off_open5m_range_pct_min"`
+		SoldOffOpen5mTodayPctMin float64 `yaml:"sold_off_open5m_today_pct_min"`
 	} `yaml:"filters"`
 
 	Risk struct {
@@ -142,6 +147,17 @@ func applyDefaults(cfg *Config) {
 		cfg.OpenAI.ResponseFormat = "mp3"
 	}
 
+	// Historic sold-off scan defaults
+	if cfg.Filters.SoldOffFromOpenPctMin <= 0 {
+		cfg.Filters.SoldOffFromOpenPctMin = 0.20
+	}
+	if cfg.Filters.SoldOffOpen5mRangePctMin <= 0 {
+		cfg.Filters.SoldOffOpen5mRangePctMin = 0.01
+	}
+	if cfg.Filters.SoldOffOpen5mTodayPctMin <= 0 {
+		cfg.Filters.SoldOffOpen5mTodayPctMin = 50
+	}
+
 	if cfg.UI.MaxEvents <= 0 {
 		cfg.UI.MaxEvents = 250
 	}
@@ -162,6 +178,17 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Filters.EntryPriceMax < cfg.Filters.EntryPriceMin {
 		return errors.New("filters.entry_price_min/max invalid")
+	}
+
+	// Sold-off scan validation
+	if cfg.Filters.SoldOffFromOpenPctMin <= 0 || cfg.Filters.SoldOffFromOpenPctMin >= 1 {
+		return errors.New("filters.sold_off_from_open_pct_min invalid (expected 0..1)")
+	}
+	if cfg.Filters.SoldOffOpen5mRangePctMin <= 0 || cfg.Filters.SoldOffOpen5mRangePctMin >= 1 {
+		return errors.New("filters.sold_off_open5m_range_pct_min invalid (expected 0..1)")
+	}
+	if cfg.Filters.SoldOffOpen5mTodayPctMin <= 0 {
+		return errors.New("filters.sold_off_open5m_today_pct_min invalid (>0)")
 	}
 	return nil
 }

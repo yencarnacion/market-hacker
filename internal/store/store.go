@@ -41,6 +41,11 @@ type RuntimeFilters struct {
 	EntryMaxAfterOpen int     `json:"entry_minutes_after_open_max"`
 	EntryPriceMin     float64 `json:"entry_price_min"`
 	EntryPriceMax     float64 `json:"entry_price_max"`
+
+	// Historic “sold off by 10:30” scan
+	SoldOffFromOpenPctMin    float64 `json:"sold_off_from_open_pct_min"`
+	SoldOffOpen5mRangePctMin float64 `json:"sold_off_open5m_range_pct_min"`
+	SoldOffOpen5mTodayPctMin float64 `json:"sold_off_open5m_today_pct_min"`
 }
 
 type HistoricSummary struct {
@@ -114,10 +119,25 @@ type HistoricNoEntry struct {
 	Reason string `json:"reason"`
 }
 
+type HistoricSoldOff struct {
+	Symbol string `json:"symbol"`
+
+	Open0930        float64 `json:"open_0930"`
+	LowPrice        float64 `json:"low_price"`           // low from 09:30 → 10:30
+	LowTimeNY       string  `json:"low_time_ny"`         // time of that low (NY)
+	PriceAtScanTime float64 `json:"price_at_scan_time"`  // approx px @ 10:30 (10:29→10:30 close)
+	DropPct         float64 `json:"drop_pct"`            // (open - low) / open
+
+	Open5mVol      float64 `json:"open_5m_vol"`
+	Open5mRangePct float64 `json:"open_5m_range_pct"`
+	Open5mTodayPct float64 `json:"open_5m_today_pct"`
+}
+
 type HistoricReport struct {
 	Summary   HistoricSummary   `json:"summary"`
 	Trades    []HistoricTrade   `json:"trades"`
 	NoEntries []HistoricNoEntry `json:"no_entries"`
+	SoldOff   []HistoricSoldOff `json:"sold_off,omitempty"`
 }
 
 type Event struct {
@@ -275,6 +295,10 @@ func runtimeFiltersFromConfig(cfg config.Config) RuntimeFilters {
 		EntryMaxAfterOpen: cfg.Filters.EntryMaxAfterOpen,
 		EntryPriceMin:     cfg.Filters.EntryPriceMin,
 		EntryPriceMax:     cfg.Filters.EntryPriceMax,
+
+		SoldOffFromOpenPctMin:    cfg.Filters.SoldOffFromOpenPctMin,
+		SoldOffOpen5mRangePctMin: cfg.Filters.SoldOffOpen5mRangePctMin,
+		SoldOffOpen5mTodayPctMin: cfg.Filters.SoldOffOpen5mTodayPctMin,
 	}
 }
 
@@ -293,6 +317,16 @@ func validateRuntimeFilters(f RuntimeFilters) error {
 	}
 	if f.EntryPriceMax < f.EntryPriceMin {
 		return fmt.Errorf("entry_price_min/max invalid")
+	}
+
+	if f.SoldOffFromOpenPctMin <= 0 || f.SoldOffFromOpenPctMin >= 1 {
+		return fmt.Errorf("sold_off_from_open_pct_min invalid (expected 0..1)")
+	}
+	if f.SoldOffOpen5mRangePctMin <= 0 || f.SoldOffOpen5mRangePctMin >= 1 {
+		return fmt.Errorf("sold_off_open5m_range_pct_min invalid (expected 0..1)")
+	}
+	if f.SoldOffOpen5mTodayPctMin <= 0 {
+		return fmt.Errorf("sold_off_open5m_today_pct_min invalid (>0)")
 	}
 	return nil
 }
@@ -516,16 +550,20 @@ func (s *Store) Snapshot(nowNY time.Time) Snapshot {
 		cp := *s.historicReport
 		cp.Trades = append([]HistoricTrade(nil), s.historicReport.Trades...)
 		cp.NoEntries = append([]HistoricNoEntry(nil), s.historicReport.NoEntries...)
+		cp.SoldOff = append([]HistoricSoldOff(nil), s.historicReport.SoldOff...)
 		rep = &cp
 	}
 
 	// Historic date picker bounds (NY)
+	//
+	// IMPORTANT: Do NOT artificially clamp how far back the UI can request.
+	// We only clamp the maximum (today) to prevent future dates.
 	histMin := ""
 	histMax := ""
 	if s.mode == ModeHistoric {
 		day := time.Date(nowNY.Year(), nowNY.Month(), nowNY.Day(), 0, 0, 0, 0, nowNY.Location())
 		histMax = day.Format("2006-01-02")
-		histMin = day.AddDate(0, 0, -s.cfg.History.MaxCalendarLookback).Format("2006-01-02")
+		histMin = "" // unlimited past; engine will error naturally if provider has no data
 	}
 
 	tgt := ""
